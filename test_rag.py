@@ -8,7 +8,7 @@ from pathlib import Path
 from openpyxl import Workbook
 from docx import Document
 
-from rag import RAGSystem
+from op_system import RAGSystem
 
 
 def _make_sample_dir(tmp: Path) -> Path:

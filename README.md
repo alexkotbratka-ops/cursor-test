@@ -1,54 +1,52 @@
-# OP System — RAG для анализа документов
+# OP System — RAG для анализа документов (один файл)
 
-Консольная система загрузки документов и ответов на вопросы по их содержимому с помощью **DeepSeek** и локального TF-IDF поиска.
-
-## Возможности
-
-- Загрузка: **PDF, DOCX, XLSX, TXT/MD, CSV, ZIP, RAR**
-- Разбиение текста на чанки и индексация
-- Поиск релевантных фрагментов (TF-IDF + cosine similarity)
-- Генерация ответа через DeepSeek Chat API
-- Показ источников к ответу
+Скопируйте и запустите **`op_system.py`**. Файл сам поставит зависимости, загрузит документ и ответит на вопросы через DeepSeek.
 
 ## Быстрый старт
 
 ```bash
-python -m venv .venv
-source .venv/bin/activate   # Windows: .venv\Scripts\activate
-pip install -r requirements.txt
-
-export DEEPSEEK_API_KEY='ваш_ключ'   # Windows PowerShell: $env:DEEPSEEK_API_KEY='ваш_ключ'
-python main.py
+python op_system.py
 ```
 
-Скрипт спросит путь к файлу и вопрос по документу.
+При первом запуске установятся пакеты (`requests`, `pypdf`, `python-docx`, `openpyxl`, `scikit-learn`, …).
 
-## Программный API
-
-```python
-from rag import RAGSystem
-
-rag = RAGSystem(api_key="sk-...")  # или DEEPSEEK_API_KEY в окружении
-result = rag.load_file("document.pdf")
-print(result["chunks_count"])
-
-answer = rag.ask("О чём этот документ?")
-print(answer["answer"])
-for src in answer["sources"]:
-    print(src["source"], src["text"][:120])
+API-ключ:
+```bash
+export DEEPSEEK_API_KEY='sk-...'
+python op_system.py
 ```
+или введите ключ в консоли, если переменная не задана.
+
+## Возможности
+
+- Форматы: **PDF, DOCX, XLSX, TXT/MD, CSV, ZIP, RAR**
+- Несколько файлов за сессию, цикл вопросов
+- Поиск фрагментов: TF-IDF
+- Ответы: DeepSeek Chat API
+- Показ источников
 
 ## Структура
 
 | Файл | Назначение |
 |------|------------|
-| `main.py` | Интерактивный CLI |
-| `rag.py` | Класс `RAGSystem` (загрузка, индекс, ask) |
-| `requirements.txt` | Зависимости |
-| `.env.example` | Пример переменной с API-ключом |
+| **`op_system.py`** | Полная версия в одном файле (главное) |
+| `main.py` | Короткий алиас → `op_system.main()` |
+| `rag.py` | Реэкспорт `RAGSystem` для импорта `from rag import RAGSystem` |
+| `requirements.txt` | Зависимости (опционально, есть автоустановка) |
+| `test_rag.py` | Smoke-тесты загрузки/поиска |
+
+## Программный API
+
+```python
+from op_system import RAGSystem  # или: from rag import RAGSystem
+
+rag = RAGSystem(api_key="sk-...")
+print(rag.load_file("document.pdf"))
+print(rag.ask("О чём документ?")["answer"])
+```
 
 ## Примечания
 
-- **Не коммитьте API-ключ** в репозиторий. Используйте `DEEPSEEK_API_KEY`.
-- Для RAR нужны пакет `rarfile` и системная утилита `unrar`.
-- Ответы строятся только по извлечённому тексту; сканы без OCR дадут пустой результат.
+- Не коммитьте API-ключ в репозиторий.
+- Для RAR нужны `rarfile` и системный `unrar`.
+- Сканы PDF без OCR дадут пустой текст.
