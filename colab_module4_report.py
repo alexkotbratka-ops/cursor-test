@@ -603,12 +603,6 @@ per_file_hits: Dict[str, int] = defaultdict(int)
 
 TOTAL = 86
 
-# --- RAG + synthesize + meta ---
-# Сначала все rag-вопросы
-rag_items = [q for q in QUESTIONS if q["kind"] == "rag"]
-synth_items = [q for q in QUESTIONS if q["kind"] == "synthesize"]
-meta_items = [q for q in QUESTIONS if q["kind"] == "meta"]
-
 for q in QUESTIONS:
     n = q["num"]
     print(f"[{n}/{TOTAL}] {q['title']}...")
