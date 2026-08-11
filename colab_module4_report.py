@@ -175,6 +175,299 @@ FILE_PLAN = map_expected()
 
 
 # =============================================================================
+# Классификация документов + реквизиты писем/согласований
+# =============================================================================
+
+DOC_TYPE_LETTER = "Письмо-согласование"
+DOC_TYPE_RD = "Рабочая документация"
+DOC_TYPE_ESTIMATE = "Смета"
+DOC_TYPE_TZ = "Техническое задание"
+DOC_TYPE_CONTRACT = "Договор / приложение к договору"
+DOC_TYPE_NOTICE = "Извещение / закупочная документация"
+DOC_TYPE_SCHEDULE = "График"
+DOC_TYPE_ACT = "Акт"
+DOC_TYPE_OTHER = "Прочий документ"
+DOC_TYPE_SCAN = "Скан (тип не определён)"
+
+# Явные маркеры из ТЗ + расширения для OCR/типовых формулировок
+LETTER_KW = (
+    "письмо", "согласовани", "таможн", "таможен", "фтс", "обращение",
+    "уведомлени", "разрешени", "заключаем", "не возражаем", "рассмотрев",
+)
+RD_KW = (
+    "рабочая документация", "шифр", "альбом рд", "том рд",
+    "чертеж", "спецификац", "ведомость рабочих чертежей",
+)
+EST_KW = (
+    "смета", "сметн", "лср", "вор", "локальн",
+    "единичн расцен", "итого по смете",
+)
+TZ_KW = ("техническое задание", "предмет закупки", "требования к выполнению")
+CONTRACT_KW = ("договор", "подрядчик", "заказчик обязуется", "неустойк", "гарантийный срок")
+NOTICE_KW = ("извещение", "запрос предложений", "закупочная документация", "нмцк")
+SCHEDULE_KW = ("график производства", "график освоения", "этап работ")
+ACT_KW = ("акт окончания", "акт сдачи", "приёмк")
+
+# Ключевые слова ТЗ — достаточно одного явного маркера письма
+LETTER_CORE = ("письмо", "согласовани", "таможн", "таможен", "фтс", "обращение")
+
+
+def _file_sample_text(group_key: str, max_chars: int = 12000) -> str:
+    """Собрать текст файла из чанков (начало + середина) для классификации."""
+    g = FILE_GROUPS.get(group_key)
+    if not g:
+        return ""
+    idxs = g["idxs"]
+    parts = []
+    total = 0
+    # первые чанки + равномерно ещё несколько
+    pick = list(idxs[:4])
+    if len(idxs) > 8:
+        step = max(1, len(idxs) // 6)
+        pick.extend(idxs[4::step][:6])
+    elif len(idxs) > 4:
+        pick.extend(idxs[4:8])
+    seen = set()
+    for i in pick:
+        if i in seen:
+            continue
+        seen.add(i)
+        t = D_CHUNKS[i]
+        if total + len(t) > max_chars and parts:
+            break
+        parts.append(t)
+        total += len(t)
+    return "\n".join(parts)
+
+
+def _score_keywords(text_low: str, keywords: Sequence[str]) -> int:
+    return sum(1 for kw in keywords if kw in text_low)
+
+
+def _has_rd_token(text_low: str) -> bool:
+    """«РД» как отдельный токен (не часть другого слова)."""
+    return bool(re.search(r"(?<![a-zа-я0-9])рд(?![a-zа-я0-9])", text_low))
+
+
+def classify_document(display_name: str, text: str) -> Tuple[str, List[str]]:
+    """
+    Классификация по СОДЕРЖИМОМУ (приоритетнее имени файла).
+    Возвращает (тип, список сработавших признаков).
+
+    Правила ТЗ:
+      - письмо / согласование / таможня / ФТС / обращение → Письмо-согласование
+      - рабочая документация / РД / шифр → Рабочая документация
+      - смета / ЛСР / ВОР → Смета
+    """
+    name_low = _norm(display_name)
+    text_low = (text or "").lower()
+    blob = name_low + "\n" + text_low
+    hits: List[str] = []
+
+    letter_score = _score_keywords(text_low, LETTER_KW)
+    # Контент важнее имени: «14-27-… РД …» часто письмо таможни, а не альбом РД
+    if letter_score >= 1 and any(k in text_low for k in LETTER_CORE):
+        for kw in LETTER_KW:
+            if kw in text_low:
+                hits.append(kw)
+        return DOC_TYPE_LETTER, hits[:8]
+
+    rd_score = _score_keywords(blob, RD_KW)
+    if _has_rd_token(text_low):
+        rd_score += 1
+    est_score = _score_keywords(blob, EST_KW)
+    tz_score = _score_keywords(blob, TZ_KW)
+    contract_score = _score_keywords(blob, CONTRACT_KW)
+    notice_score = _score_keywords(blob, NOTICE_KW)
+    sched_score = _score_keywords(blob, SCHEDULE_KW)
+    act_score = _score_keywords(blob, ACT_KW)
+
+    # эвристики по имени (без 14-27-… — это часто исходящий № письма)
+    if "лср" in name_low or "вор" in name_low or "смет" in name_low:
+        est_score += 3
+    if "рабочая документация" in name_low or re.search(r"(?:^|[^a-zа-я0-9])рд(?:[^a-zа-я0-9]|$)", name_low):
+        # только если нет явных маркеров письма в тексте
+        if not any(k in text_low for k in LETTER_CORE):
+            rd_score += 2
+    if "техническое задание" in name_low or (name_low.endswith(".doc") and "приложение № 1" in name_low):
+        tz_score += 2
+    if "договор" in name_low:
+        contract_score += 2
+    if "извещение" in name_low or "закупочная" in name_low:
+        notice_score += 3
+    if "график" in name_low:
+        sched_score += 3
+    if "акт" in name_low:
+        act_score += 3
+
+    ranked = [
+        (est_score, DOC_TYPE_ESTIMATE, EST_KW),
+        (rd_score, DOC_TYPE_RD, RD_KW),
+        (tz_score, DOC_TYPE_TZ, TZ_KW),
+        (contract_score, DOC_TYPE_CONTRACT, CONTRACT_KW),
+        (notice_score, DOC_TYPE_NOTICE, NOTICE_KW),
+        (sched_score, DOC_TYPE_SCHEDULE, SCHEDULE_KW),
+        (act_score, DOC_TYPE_ACT, ACT_KW),
+        (letter_score, DOC_TYPE_LETTER, LETTER_KW),
+    ]
+    ranked.sort(key=lambda x: x[0], reverse=True)
+    best_score, best_type, best_kws = ranked[0]
+    if best_score <= 0:
+        # OCR-текст есть, но тип неясен
+        if len((text or "").strip()) > 40:
+            return DOC_TYPE_SCAN, ["текст есть, ключевых маркеров нет"]
+        return DOC_TYPE_OTHER, ["пусто / мало текста"]
+
+    for kw in best_kws:
+        if kw in blob:
+            hits.append(kw)
+    if best_type == DOC_TYPE_RD and _has_rd_token(text_low) and "рд" not in hits:
+        hits.append("рд")
+    return best_type, hits[:8]
+
+
+LETTER_EXTRACT_PROMPT = """Это текст документа. Определи, является ли он письмом / согласованием / разрешением.
+Если да — извлеки реквизиты СТРОГО в формате:
+
+Тип: Письмо-согласование
+Дата письма: ...
+Номер письма: ...
+Отправитель: ...
+Получатель: ...
+Суть согласования: ...
+Результат (согласовано/отказано/с замечаниями): ...
+
+Если какого-то поля нет — напиши «Не указано».
+Если это НЕ письмо/согласование — первой строкой напиши: Тип: не письмо
+и кратко что это за документ.
+"""
+
+
+def extract_letter_requisites(display_name: str, text: str) -> Dict[str, str]:
+    """Извлечение реквизитов письма через DeepSeek (+ regex-подсказки)."""
+    result = {
+        "Тип": DOC_TYPE_LETTER,
+        "Дата письма": "Не указано",
+        "Номер письма": "Не указано",
+        "Отправитель": "Не указано",
+        "Получатель": "Не указано",
+        "Суть согласования": "Не указано",
+        "Результат": "Не указано",
+        "Файл": display_name,
+    }
+    # regex-подсказки из имени файла: «14-27-03537 от 20.04.2026 …»
+    m_num = re.search(r"(14-27-\d+)", display_name)
+    m_date = re.search(r"от\s+(\d{2}[.\-]\d{2}[.\-]\d{4})", display_name, re.I)
+    if m_num:
+        result["Номер письма"] = m_num.group(1)
+    if m_date:
+        result["Дата письма"] = m_date.group(1).replace("-", ".")
+
+    if not (text or "").strip():
+        return result
+
+    try:
+        raw = ask_deepseek(LETTER_EXTRACT_PROMPT, context=text[:14000])
+    except Exception as e:
+        result["Суть согласования"] = f"Ошибка извлечения: {e}"
+        return result
+
+    raw = (raw or "").strip()
+    if re.search(r"тип:\s*не письмо", raw, re.I):
+        result["Тип"] = "не письмо"
+        result["Суть согласования"] = raw
+        return result
+
+    def _field(patterns: Sequence[str]) -> Optional[str]:
+        for pat in patterns:
+            m = re.search(pat, raw, flags=re.I | re.M)
+            if m:
+                val = m.group(1).strip().strip(" .;")
+                if val and val.lower() not in ("не указано", "-", "нет"):
+                    return val
+        return None
+
+    date = _field([r"Дата письма:\s*(.+)", r"Дата:\s*(.+)"])
+    number = _field([r"Номер письма:\s*(.+)", r"№\s*([^\n]+)", r"Исх\.?\s*№?\s*([^\n]+)"])
+    sender = _field([r"Отправитель:\s*(.+)", r"От кого:\s*(.+)"])
+    receiver = _field([r"Получатель:\s*(.+)", r"Кому:\s*(.+)"])
+    essence = _field([r"Суть согласования:\s*(.+)", r"Суть:\s*(.+)"])
+    outcome = _field([r"Результат[^:]*:\s*(.+)", r"Решение:\s*(.+)"])
+
+    if date:
+        result["Дата письма"] = date
+    if number:
+        result["Номер письма"] = number
+    if sender:
+        result["Отправитель"] = sender
+    if receiver:
+        result["Получатель"] = receiver
+    if essence:
+        result["Суть согласования"] = essence
+    if outcome:
+        result["Результат"] = outcome
+
+    # доп. regex по самому тексту, если LLM не нашёл
+    if result["Дата письма"] == "Не указано":
+        m = re.search(r"\b(\d{2}[.\-/]\d{2}[.\-/]\d{4})\b", text[:2000])
+        if m:
+            result["Дата письма"] = m.group(1).replace("-", ".").replace("/", ".")
+    if result["Номер письма"] == "Не указано":
+        m = re.search(r"(?:исх\.?\s*№?|№)\s*([A-Za-zА-Яа-я0-9\-_/]+)", text[:2000], re.I)
+        if m:
+            result["Номер письма"] = m.group(1)
+
+    return result
+
+
+print("🏷️ Классификация документов по содержимому...")
+FILE_CLASSIFICATION: Dict[str, Dict[str, Any]] = {}  # group_key -> meta
+APPROVALS: List[Dict[str, str]] = []
+
+for exp, key in FILE_PLAN:
+    if key is None:
+        FILE_CLASSIFICATION[exp] = {
+            "key": None,
+            "display": exp,
+            "doc_type": "Не найден в индексе",
+            "signals": [],
+            "sample_chars": 0,
+        }
+        continue
+    display = FILE_GROUPS[key]["display"]
+    sample = _file_sample_text(key)
+    doc_type, signals = classify_document(display, sample)
+    meta = {
+        "key": key,
+        "display": display,
+        "label": exp,
+        "doc_type": doc_type,
+        "signals": signals,
+        "sample_chars": len(sample),
+        "sample": sample,
+    }
+    FILE_CLASSIFICATION[key] = meta
+    print(f"   • {display}: {doc_type} [{', '.join(signals[:4]) or '—'}]")
+
+    # письма / согласования — извлекаем реквизиты
+    if doc_type == DOC_TYPE_LETTER or (
+        letter_score := _score_keywords(sample.lower(), LETTER_KW)
+    ) >= 2:
+        # даже если имя «РД …», при сильных признаках письма — извлекаем
+        if doc_type != DOC_TYPE_LETTER and letter_score >= 2:
+            doc_type = DOC_TYPE_LETTER
+            meta["doc_type"] = DOC_TYPE_LETTER
+            print(f"     ↳ переклассифицирован в «{DOC_TYPE_LETTER}» по содержимому")
+        print(f"     ✉️ Извлечение реквизитов письма...")
+        req = extract_letter_requisites(display, sample)
+        meta["letter"] = req
+        if req.get("Тип") != "не письмо":
+            APPROVALS.append(req)
+
+print(f"   Найдено писем/согласований: {len(APPROVALS)}")
+
+
+# =============================================================================
 # Поиск
 # =============================================================================
 
@@ -668,6 +961,7 @@ for q in QUESTIONS:
 file_status_rows = []
 for exp, key in FILE_PLAN:
     if key is None:
+        cls = FILE_CLASSIFICATION.get(exp, {})
         file_status_rows.append({
             "file": exp,
             "in_index": "Нет",
@@ -675,6 +969,8 @@ for exp, key in FILE_PLAN:
             "hits": 0,
             "chunks": 0,
             "chars": 0,
+            "doc_type": cls.get("doc_type", "Не найден в индексе"),
+            "signals": cls.get("signals", []),
             "reason": "Не найден в индексе после дедупликации",
         })
         continue
@@ -682,6 +978,7 @@ for exp, key in FILE_PLAN:
     hits = per_file_hits.get(key, 0)
     used = "Да" if hits > 0 else "Нет"
     reason = "" if used == "Да" else "Ни один ответ не сослался на чанки этого файла (низкая релевантность / маска поиска)"
+    cls = FILE_CLASSIFICATION.get(key, {})
     file_status_rows.append({
         "file": exp if exp in EXPECTED_FILES else g["display"],
         "in_index": "Да",
@@ -689,6 +986,8 @@ for exp, key in FILE_PLAN:
         "hits": hits,
         "chunks": len(g["idxs"]),
         "chars": g["chars"],
+        "doc_type": cls.get("doc_type", DOC_TYPE_OTHER),
+        "signals": cls.get("signals", []),
         "reason": reason,
     })
 
@@ -718,9 +1017,16 @@ for q in QUESTIONS:
             if qq["num"] in answers:
                 facts.append(f"{qq['num']}. {qq['title']}: {answers[qq['num']]}")
         facts.append("Статус файлов:\n" + "\n".join(
-            f"- {r['file']}: index={r['in_index']}, used={r['used']}, hits={r['hits']}, reason={r['reason']}"
+            f"- {r['file']}: type={r.get('doc_type')}, index={r['in_index']}, "
+            f"used={r['used']}, hits={r['hits']}, reason={r['reason']}"
             for r in file_status_rows
         ))
+        if APPROVALS:
+            facts.append("Согласования:\n" + "\n".join(
+                f"- {a.get('Файл')}: №{a.get('Номер письма')}, {a.get('Дата письма')}, "
+                f"{a.get('Отправитель')} → {a.get('Суть согласования')}"
+                for a in APPROVALS
+            ))
         ctx = "\n\n".join(facts)
         if len(ctx) > 30000:
             ctx = ctx[:30000]
@@ -754,6 +1060,28 @@ def format_report() -> str:
     lines.append(f"Загружено файлов (upload): {uploaded_count}")
     lines.append(f"Уникальных файлов (дедуп): {unique_count}")
     lines.append(f"Чанков исходных / после дедупа: {len(rag_index.chunks)} / {len(D_CHUNKS)}")
+    lines.append(f"Писем/согласований найдено: {len(APPROVALS)}")
+    lines.append("")
+
+    # --- Согласования и разрешения (сразу после шапки) ---
+    lines.append("=" * 70)
+    lines.append("СОГЛАСОВАНИЯ И РАЗРЕШЕНИЯ")
+    lines.append("=" * 70)
+    if not APPROVALS:
+        lines.append("Письма-согласования / разрешения не обнаружены "
+                     "(или OCR не дал достаточно текста для классификации).")
+    else:
+        for i, a in enumerate(APPROVALS, start=1):
+            lines.append("")
+            lines.append(f"--- Согласование {i} ---")
+            lines.append(f"Файл: {a.get('Файл', 'Не указано')}")
+            lines.append(f"Тип: {a.get('Тип', DOC_TYPE_LETTER)}")
+            lines.append(f"Дата письма: {a.get('Дата письма', 'Не указано')}")
+            lines.append(f"Номер письма: {a.get('Номер письма', 'Не указано')}")
+            lines.append(f"Отправитель: {a.get('Отправитель', 'Не указано')}")
+            lines.append(f"Получатель: {a.get('Получатель', 'Не указано')}")
+            lines.append(f"Суть согласования: {a.get('Суть согласования', 'Не указано')}")
+            lines.append(f"Результат: {a.get('Результат', 'Не указано')}")
     lines.append("")
 
     cur_sec = None
@@ -769,7 +1097,7 @@ def format_report() -> str:
         lines.append(f"{q['num']}. {q['title']}")
         lines.append("-" * 70)
         lines.append(answers.get(q["num"], "Не указано"))
-        srcs = sources_used.get(q["num"] ) or []
+        srcs = sources_used.get(q["num"]) or []
         if srcs:
             lines.append("Источники: " + "; ".join(srcs[:10]))
 
@@ -777,11 +1105,20 @@ def format_report() -> str:
     lines.append("=" * 70)
     lines.append("СТАТУС ОБРАБОТКИ ФАЙЛОВ")
     lines.append("=" * 70)
-    lines.append(f"{'Файл':<70} {'В индексе':<10} {'Использован':<12} {'Hits':<6} {'Чанков'}")
-    lines.append("-" * 110)
+    lines.append(
+        f"{'Файл':<48} {'Тип документа':<28} {'Индекс':<8} {'Исп.':<6} {'Hits':<5} {'Чанков'}"
+    )
+    lines.append("-" * 120)
     for r in file_status_rows:
-        name = r["file"] if len(r["file"]) <= 68 else r["file"][:65] + "..."
-        lines.append(f"{name:<70} {r['in_index']:<10} {r['used']:<12} {r['hits']:<6} {r['chunks']}")
+        name = r["file"] if len(r["file"]) <= 46 else r["file"][:43] + "..."
+        dtype = str(r.get("doc_type", ""))
+        if len(dtype) > 26:
+            dtype = dtype[:23] + "..."
+        lines.append(
+            f"{name:<48} {dtype:<28} {r['in_index']:<8} {r['used']:<6} {r['hits']:<5} {r['chunks']}"
+        )
+        if r.get("signals"):
+            lines.append(f"   признаки: {', '.join(r['signals'][:6])}")
         if r["used"] == "Нет":
             lines.append(f"   причина: {r['reason']}")
         lines.append(f"   символов текста: {r['chars']:,}")
