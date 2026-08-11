@@ -7,6 +7,7 @@
 import hashlib
 import os
 import re
+import time
 from collections import defaultdict
 from datetime import datetime
 from typing import Any, Dict, List, Optional, Sequence, Set, Tuple
@@ -29,9 +30,10 @@ from sklearn.metrics.pairwise import cosine_similarity
 import numpy as np
 
 ANALYSIS_DATE = datetime.now()
-TOP_K = 12
-TOP_K_FORCED = 16
-MAX_CTX = 16000
+TOP_K = 5                            # было 12 — меньше контекста, быстрее ответ
+TOP_K_FORCED = 8
+MAX_CTX = 12000
+DEEPSEEK_TIMEOUT = 60                # было 120 сек.
 
 # =============================================================================
 # Ожидаемые 14 файлов
@@ -367,7 +369,7 @@ def extract_letter_requisites(display_name: str, text: str) -> Dict[str, str]:
         return result
 
     try:
-        raw = ask_deepseek(LETTER_EXTRACT_PROMPT, context=text[:14000])
+        raw = ask_deepseek(LETTER_EXTRACT_PROMPT, context=text[:14000], timeout=DEEPSEEK_TIMEOUT)
     except Exception as e:
         result["Суть согласования"] = f"Ошибка извлечения: {e}"
         return result
@@ -464,6 +466,16 @@ for exp, key in FILE_PLAN:
         if req.get("Тип") != "не письмо":
             APPROVALS.append(req)
 
+# дедуп согласований по номер+дата+файл
+_seen_appr = set()
+_uniq_appr: List[Dict[str, str]] = []
+for a in APPROVALS:
+    key = (a.get("Номер письма"), a.get("Дата письма"), a.get("Файл"))
+    if key in _seen_appr:
+        continue
+    _seen_appr.add(key)
+    _uniq_appr.append(a)
+APPROVALS = _uniq_appr
 print(f"   Найдено писем/согласований: {len(APPROVALS)}")
 
 
@@ -569,7 +581,8 @@ def ask_rag(
     top_k: int = TOP_K,
 ) -> Tuple[str, List[Dict[str, Any]]]:
     variants = variants or []
-    queries = [question] + variants
+    # Для скорости: основной вопрос + максимум 1 вариант (не все)
+    queries = [question] + (variants[:1] if variants else [])
     lists = []
     for q in queries:
         lists.append(search(q, top_k=top_k, masks=masks, mask_only=False))
@@ -578,15 +591,23 @@ def ask_rag(
     hits = merge_hits(lists, top_k=top_k)
     if not hits:
         return "Не указано", []
-    ans = clean(ask_deepseek(f"{PRIORITY_PROMPT}\n\nВопрос: {question}", context=fmt_ctx(hits)))
-    if ans == "Не указано" and (variants or masks):
-        rq = (variants[-1] if variants else question) + " Приведи любые найденные факты из контекста."
+    ans = clean(ask_deepseek(
+        f"{PRIORITY_PROMPT}\n\nВопрос: {question}",
+        context=fmt_ctx(hits),
+        timeout=DEEPSEEK_TIMEOUT,
+    ))
+    if ans == "Не указано" and variants:
+        rq = variants[-1] + " Приведи любые найденные факты из контекста."
         rh = merge_hits(
             [search(rq, top_k=top_k, masks=masks, mask_only=bool(masks)), hits],
             top_k=top_k,
         )
         if rh:
-            ans2 = clean(ask_deepseek(f"{PRIORITY_PROMPT}\n\nВопрос: {rq}", context=fmt_ctx(rh)))
+            ans2 = clean(ask_deepseek(
+                f"{PRIORITY_PROMPT}\n\nВопрос: {rq}",
+                context=fmt_ctx(rh),
+                timeout=DEEPSEEK_TIMEOUT,
+            ))
             if ans2 != "Не указано":
                 return ans2, rh
     return ans, hits
@@ -879,10 +900,11 @@ def find_tender_no() -> str:
 # Запуск
 # =============================================================================
 
-print("🚀 Модуль 4: 86 вопросов по всем файлам тендера")
+print("🚀 Модуль 4: 86 вопросов по всем файлам тендера (ускоренный режим)")
 print(f"   Уник. файлов: {len(FILE_GROUPS)}")
 print(f"   Чанков после дедупа: {len(D_CHUNKS)}")
 print(f"   Вопросов: {len(QUESTIONS)}")
+print(f"   TOP_K={TOP_K}, DeepSeek timeout={DEEPSEEK_TIMEOUT}с")
 print()
 
 tender_no = find_tender_no()
@@ -896,9 +918,39 @@ per_file_hits: Dict[str, int] = defaultdict(int)
 
 TOTAL = 86
 
+
+def _fmt_eta(seconds: float) -> str:
+    if seconds != seconds or seconds < 0:
+        return "—"
+    seconds = int(round(seconds))
+    if seconds < 60:
+        return f"{seconds} сек."
+    minutes = seconds // 60
+    if minutes < 60:
+        return f"{minutes} мин."
+    return f"{minutes // 60} ч. {minutes % 60} мин."
+
+
+def _progress_bar(done: int, total: int, t0: float, title: str = "") -> str:
+    total = max(1, total)
+    pct = 100.0 * done / total
+    width = 12
+    filled = min(width, max(0, int(round(width * done / total))))
+    bar = "█" * filled + "░" * (width - filled)
+    elapsed = time.time() - t0
+    if done > 0:
+        eta_s = _fmt_eta(elapsed * (total - done) / done)
+    else:
+        eta_s = "оценка…"
+    short = (title[:42] + "…") if len(title) > 43 else title
+    return f"[{bar}] {pct:.0f}% ({eta_s} осталось)  {done}/{total} {short}"
+
+
+_t0_analysis = time.time()
+
 for q in QUESTIONS:
     n = q["num"]
-    print(f"[{n}/{TOTAL}] {q['title']}...")
+    print(_progress_bar(n - 1, TOTAL, _t0_analysis, q["title"]), flush=True)
 
     if q["kind"] == "rag":
         # спец: номер тендера из имени файла
@@ -948,7 +1000,7 @@ for q in QUESTIONS:
             "Не противоречь им. Различай НМЦК и сметный ориентир.\n\n"
             f"Задание: {q['question']}"
         )
-        answers[n] = clean(ask_deepseek(prompt, context=ctx or "Факты отсутствуют."))
+        answers[n] = clean(ask_deepseek(prompt, context=ctx or "Факты отсутствуют.", timeout=DEEPSEEK_TIMEOUT))
         sources_used[n] = ["(синтез ответов 1–N)"]
 
     elif q["kind"] == "meta":
@@ -956,6 +1008,8 @@ for q in QUESTIONS:
         answers[n] = "<<META>>"
         sources_used[n] = ["(статистика модуля 4)"]
 
+print(_progress_bar(TOTAL, TOTAL, _t0_analysis, "основной проход"), flush=True)
+print(f"⏱️ Основной проход: {_fmt_eta(time.time() - _t0_analysis)}")
 
 # --- Статус файлов ---
 file_status_rows = []
@@ -1009,7 +1063,7 @@ answers[84] = "\n".join(
 # synthesize 85-86 now that meta ready
 for q in QUESTIONS:
     if q["num"] in (85, 86):
-        print(f"[{q['num']}/{TOTAL}] {q['title']} (финальный синтез)...")
+        print(_progress_bar(q["num"] - 1, TOTAL, _t0_analysis, q["title"] + " (финальный синтез)"), flush=True)
         facts = []
         for qq in QUESTIONS:
             if qq["num"] == q["num"]:
@@ -1033,9 +1087,12 @@ for q in QUESTIONS:
         answers[q["num"]] = clean(ask_deepseek(
             f"{PRIORITY_PROMPT}\n\nЗадание: {q['question']}",
             context=ctx,
+            timeout=DEEPSEEK_TIMEOUT,
         ))
         sources_used[q["num"]] = ["(синтез + статус файлов)"]
 
+print(_progress_bar(TOTAL, TOTAL, _t0_analysis, "анализ завершён"), flush=True)
+print(f"⏱️ Полный анализ: {_fmt_eta(time.time() - _t0_analysis)}")
 
 # =============================================================================
 # Отчёт
@@ -1145,6 +1202,7 @@ print()
 print("✅ Отчёт сформирован!")
 print(f"📁 Файл: {report_filename}")
 print(f"📊 Вопросов: {TOTAL}")
+print(f"⚡ Режим: TOP_K={TOP_K}, timeout={DEEPSEEK_TIMEOUT}с, ETA-бар включён")
 print(f"📂 Файлов использовано: {sum(1 for r in file_status_rows if r['used']=='Да')} / {len(file_status_rows)}")
 if tender_no:
     print(f"🔖 Номер тендера: {tender_no}")

@@ -78,6 +78,7 @@ import os
 import re
 import tarfile
 import tempfile
+import time
 import zipfile
 import xml.etree.ElementTree as ET
 from getpass import getpass
@@ -139,20 +140,19 @@ os.environ["DEEPSEEK_API_KEY"] = DEEPSEEK_API_KEY
 DEEPSEEK_API_URL = "https://api.deepseek.com/chat/completions"
 DEEPSEEK_MODEL = "deepseek-chat"
 
-CHUNK_SIZE = 800
-CHUNK_OVERLAP = 150
+CHUNK_SIZE = 600
+CHUNK_OVERLAP = 100
 TOP_K = 5
 OCR_LANG = "rus+eng"
+DEEPSEEK_TIMEOUT = 60                # сек. на ответ API (было 120)
 
 # Пороги детекции сканов / «бедного» текста
-# Раньше OCR запускался ТОЛЬКО если page.get_text() == "" — из‑за этого
-# сканы писем с мусорным/невидимым текстовым слоем или 1–2 словами
-# (номер страницы) полностью пропускали OCR.
-OCR_MIN_CHARS_PER_PAGE = 80          # меньше → страница считается сканом
+# Быстрая проверка: если цифровой текст уже есть (≥ порога) — OCR не запускаем.
+OCR_MIN_CHARS_PER_PAGE = 30          # меньше → страница считается сканом (было 80)
 OCR_MIN_ALPHA_RATIO = 0.35           # доля букв среди непробельных символов
-OCR_IMAGE_AREA_RATIO = 0.45          # доля площади страницы под картинками
-OCR_DPI = 200                        # dpi для pdf2image / pixmap (баланс скорость/качество)
-OCR_PDF_FORCE_FULL_IF_AVG_BELOW = 25 # средний символов/стр. → полный OCR всего PDF
+OCR_IMAGE_AREA_RATIO = 0.55          # доля площади страницы под картинками
+OCR_DPI = 200                        # dpi для pdf2image / pixmap (было 300)
+OCR_PDF_FORCE_FULL_IF_AVG_BELOW = 15 # средний символов/стр. → полный OCR всего PDF
 
 SUPPORTED_DOCS = {
     # документы
@@ -305,23 +305,27 @@ def _page_image_area_ratio(page) -> float:
 def page_needs_ocr(page, digital_text: str) -> bool:
     """
     Решение: нужен ли OCR для страницы.
-    Срабатывает не только на пустой текст, но и на «бедный» текст /
-    страницы-сканы с картинкой на весь лист.
+    Быстрая проверка: если цифровой текст уже есть — OCR НЕ запускаем.
+    OCR только для пустых / почти пустых страниц.
     """
     stats = _text_quality_stats(digital_text)
-    if stats["chars"] < OCR_MIN_CHARS_PER_PAGE:
+    # Главный ускоритель: текст уже извлечён → пропускаем OCR
+    if stats["chars"] >= OCR_MIN_CHARS_PER_PAGE:
+        return False
+    if not (digital_text or "").strip():
         return True
-    if stats["alpha_ratio"] < OCR_MIN_ALPHA_RATIO and stats["chars"] < 400:
+    # Очень бедный текст + картинка на весь лист → скан
+    if (
+        stats["chars"] < OCR_MIN_CHARS_PER_PAGE
+        and _page_image_area_ratio(page) >= OCR_IMAGE_AREA_RATIO
+    ):
         return True
-    if _page_image_area_ratio(page) >= OCR_IMAGE_AREA_RATIO and stats["chars"] < 500:
-        return True
-    return False
+    return stats["chars"] < OCR_MIN_CHARS_PER_PAGE
 
 
 def ocr_pdf_page(page, page_no: int, filename: str = "") -> str:
     """Рендер страницы PDF → OCR."""
     try:
-        # 300 dpi ≈ 300/72 = 4.167
         zoom = OCR_DPI / 72.0
         pix = page.get_pixmap(matrix=fitz.Matrix(zoom, zoom), alpha=False)
         img = Image.open(io.BytesIO(pix.tobytes("png")))
@@ -334,13 +338,14 @@ def ocr_pdf_page(page, page_no: int, filename: str = "") -> str:
 
 def extract_text_from_pdf(file_bytes: bytes, filename: str = "") -> str:
     """
-    PDF: цифровой текст + принудительный OCR для сканов.
-    Раньше OCR был только при text=='' — сканы писем пропускались.
+    PDF: цифровой текст; OCR только если текста нет / почти нет.
+    Если в PDF уже есть текст — OCR не запускается (ускорение).
     """
     parts: List[str] = []
     ocr_pages = 0
     digital_chars_total = 0
     page_count = 0
+    digital_pages = 0
 
     try:
         doc = fitz.open(stream=file_bytes, filetype="pdf")
@@ -352,23 +357,23 @@ def extract_text_from_pdf(file_bytes: bytes, filename: str = "") -> str:
 
             page_bits: List[str] = []
             if digital and not need_ocr:
+                # Быстрый путь: текст есть → без OCR
+                digital_pages += 1
                 page_bits.append(digital)
-            elif digital and need_ocr:
-                # гибрид: оставляем цифровой слой + дополняем OCR
-                page_bits.append(digital)
+            elif need_ocr:
                 ocr_text = ocr_pdf_page(page, i, filename)
                 if ocr_text:
                     ocr_pages += 1
-                    # если OCR дал существенно больше — приоритет OCR
-                    if len(ocr_text) > len(digital) * 1.2:
-                        page_bits = [f"[OCR]\n{ocr_text}"]
+                    if digital and len(digital) > 10:
+                        # гибрид только если OCR реально богаче
+                        if len(ocr_text) > len(digital) * 1.2:
+                            page_bits = [f"[OCR]\n{ocr_text}"]
+                        else:
+                            page_bits = [digital, f"[OCR-дополнение]\n{ocr_text}"]
                     else:
-                        page_bits.append(f"[OCR-дополнение]\n{ocr_text}")
-            else:
-                ocr_text = ocr_pdf_page(page, i, filename)
-                if ocr_text:
-                    ocr_pages += 1
-                    page_bits.append(f"[OCR]\n{ocr_text}")
+                        page_bits.append(f"[OCR]\n{ocr_text}")
+                elif digital:
+                    page_bits.append(digital)
 
             if page_bits:
                 parts.append(f"[Страница {i}]\n" + "\n".join(page_bits))
@@ -381,9 +386,9 @@ def extract_text_from_pdf(file_bytes: bytes, filename: str = "") -> str:
 
     result = "\n\n".join(parts)
 
-    # Если в среднем мало символов — полный проход pdf2image @ 300 dpi
+    # Полный OCR только если почти нет цифрового текста
     avg = (digital_chars_total / page_count) if page_count else 0
-    if page_count and (avg < OCR_PDF_FORCE_FULL_IF_AVG_BELOW or (ocr_pages == 0 and len(result) < OCR_MIN_CHARS_PER_PAGE * page_count)):
+    if page_count and avg < OCR_PDF_FORCE_FULL_IF_AVG_BELOW and digital_pages == 0:
         print(f"  🔍 PDF похож на скан (avg={avg:.0f} симв/стр, OCR-стр={ocr_pages}) — полный OCR: {filename}")
         full = ocr_pdf_bytes(file_bytes, filename)
         if len(full) > len(result):
@@ -1346,6 +1351,7 @@ def ask_deepseek(
     api_key: Optional[str] = None,
     model: str = DEEPSEEK_MODEL,
     temperature: float = 0.2,
+    timeout: Optional[float] = None,
 ) -> str:
     """
     Отправляет вопрос в DeepSeek Chat Completions API.
@@ -1366,6 +1372,8 @@ def ask_deepseek(
         system_prompt = "Ты полезный помощник. Отвечай кратко и по делу."
         user_content = question
 
+    req_timeout = DEEPSEEK_TIMEOUT if timeout is None else timeout
+
     try:
         resp = requests.post(
             DEEPSEEK_API_URL,
@@ -1381,7 +1389,7 @@ def ask_deepseek(
                 ],
                 "temperature": temperature,
             },
-            timeout=120,
+            timeout=req_timeout,
         )
         resp.raise_for_status()
         data = resp.json()
@@ -1395,6 +1403,69 @@ def ask_deepseek(
         return f"❌ Ошибка DeepSeek API ({e}): {detail}"
     except Exception as e:
         return f"❌ Ошибка запроса к DeepSeek: {e}"
+
+
+class ProgressBar:
+    """
+    Простой прогресс-бар с ETA:
+    [████████░░░░] 67% (3 мин. осталось)
+    """
+
+    def __init__(self, total: int, label: str = "", width: int = 12):
+        self.total = max(1, int(total))
+        self.label = label
+        self.width = max(4, int(width))
+        self.done = 0
+        self.t0 = time.time()
+
+    @staticmethod
+    def _fmt_eta(seconds: float) -> str:
+        if seconds < 0 or seconds != seconds:  # NaN
+            return "—"
+        seconds = int(round(seconds))
+        if seconds < 60:
+            return f"{seconds} сек."
+        minutes = seconds // 60
+        if minutes < 60:
+            rem = seconds % 60
+            return f"{minutes} мин." if rem < 15 else f"{minutes} мин. {rem} сек."
+        hours = minutes // 60
+        minutes = minutes % 60
+        return f"{hours} ч. {minutes} мин."
+
+    def render(self, done: Optional[int] = None, suffix: str = "") -> str:
+        if done is not None:
+            self.done = done
+        n = min(self.done, self.total)
+        pct = 100.0 * n / self.total
+        filled = int(round(self.width * n / self.total))
+        filled = min(self.width, max(0, filled))
+        bar = "█" * filled + "░" * (self.width - filled)
+        elapsed = time.time() - self.t0
+        if n > 0:
+            eta = elapsed * (self.total - n) / n
+            eta_s = self._fmt_eta(eta)
+        else:
+            eta_s = "оценка…"
+        label = f"{self.label} " if self.label else ""
+        extra = f" {suffix}" if suffix else ""
+        return f"{label}[{bar}] {pct:.0f}% ({eta_s} осталось){extra}"
+
+    def tick(self, step: int = 1, suffix: str = "") -> str:
+        self.done = min(self.total, self.done + step)
+        line = self.render(suffix=suffix)
+        print(line, flush=True)
+        return line
+
+    def finish(self, suffix: str = "готово") -> str:
+        self.done = self.total
+        elapsed = time.time() - self.t0
+        label = f"{self.label} " if self.label else ""
+        bar = "█" * self.width
+        extra = f" {suffix}" if suffix else ""
+        line = f"{label}[{bar}] 100% (заняло {self._fmt_eta(elapsed)}){extra}"
+        print(line, flush=True)
+        return line
 
 
 def ask_with_rag(question: str, top_k: int = TOP_K) -> Dict[str, Any]:
@@ -1426,8 +1497,8 @@ print(
     "dwg/dxf, ppt/pptx + fallback OCR для бинарных/без расширения."
 )
 print(
-    f"🔍 OCR: порог {OCR_MIN_CHARS_PER_PAGE} симв/стр, "
-    f"доля картинки ≥{OCR_IMAGE_AREA_RATIO}, dpi={OCR_DPI}, lang={OCR_LANG}"
+    f"🔍 OCR: порог {OCR_MIN_CHARS_PER_PAGE} симв/стр (текст есть → без OCR), "
+    f"dpi={OCR_DPI}, timeout DeepSeek={DEEPSEEK_TIMEOUT}с, chunk={CHUNK_SIZE}"
 )
 if DEEPSEEK_API_KEY:
     print("🔐 API-ключ DeepSeek сохранён в сессии.")

@@ -3,13 +3,15 @@
 # Выполняйте строго ПОСЛЕ модуля 2.
 # Оптимизации:
 #   1) дедупликация по basename + MD5 до обработки
-#   2) OCR: dpi=200, не гонять OCR если текст уже есть
-#   3) параллельная обработка через ThreadPoolExecutor
+#   2) OCR: dpi=200, порог 30 симв — если текст есть, OCR не запускаем
+#   3) chunk_size=600, TOP_K=6
+#   4) параллельная обработка + прогресс-бар с ETA
 # =============================================================================
 
 import hashlib
 import re
 import threading
+import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Dict, List, Optional, Set, Tuple
 
@@ -27,33 +29,29 @@ if "rag_index" not in globals() or not isinstance(rag_index, RAGIndex):
 
 
 # =============================================================================
-# 1) OCR-оптимизации (переопределяем настройки модуля 1 в сессии)
+# 1) OCR + размер чанков + TOP_K (переопределяем настройки модуля 1)
 # =============================================================================
 
-# Снижаем dpi: качество почти то же, OCR заметно быстрее
 OCR_DPI = 200
-
-# Не запускать «полный» OCR всего PDF агрессивно
 OCR_PDF_FORCE_FULL_IF_AVG_BELOW = 15
-
-# OCR только если текста почти нет (быстрая проверка «уже есть текст»)
-OCR_MIN_CHARS_PER_PAGE = 25
+OCR_MIN_CHARS_PER_PAGE = 30          # как в модуле 1 (было 80)
 OCR_MIN_ALPHA_RATIO = 0.25
-OCR_IMAGE_AREA_RATIO = 0.70  # картинка должна реально доминировать
+OCR_IMAGE_AREA_RATIO = 0.70
+
+CHUNK_SIZE = 600                     # было 800
+CHUNK_OVERLAP = 100
+TOP_K = 6                            # 5–8 для поиска в сессии
 
 
 def page_needs_ocr(page, digital_text: str) -> bool:
     """
     Быстрая проверка: если цифровой текст уже есть — OCR не нужен.
-    OCR только для пустых / почти пустых страниц или явных сканов.
     """
     text = (digital_text or "").strip()
     if len(text) >= OCR_MIN_CHARS_PER_PAGE:
-        # текст уже извлечён — пропускаем OCR (ускорение)
         return False
     if not text:
         return True
-    # очень бедный текст + большая картинка → скан
     try:
         rect = page.rect
         page_area = abs(rect.width * rect.height) or 1.0
@@ -70,7 +68,13 @@ def page_needs_ocr(page, digital_text: str) -> bool:
     return ratio >= OCR_IMAGE_AREA_RATIO and len(text) < OCR_MIN_CHARS_PER_PAGE
 
 
-print(f"⚙️ OCR: dpi={OCR_DPI}, OCR только если текст < {OCR_MIN_CHARS_PER_PAGE} симв/стр")
+# Пересоздаём индекс с новым размером чанка
+rag_index = RAGIndex(chunk_size=CHUNK_SIZE, chunk_overlap=CHUNK_OVERLAP)
+
+print(
+    f"⚙️ OCR: dpi={OCR_DPI}, OCR только если текст < {OCR_MIN_CHARS_PER_PAGE} симв/стр"
+)
+print(f"⚙️ Индекс: chunk_size={CHUNK_SIZE}, overlap={CHUNK_OVERLAP}, TOP_K={TOP_K}")
 
 
 # =============================================================================
@@ -83,6 +87,25 @@ _PRINT_LOCK = threading.Lock()
 def _log(*args, **kwargs):
     with _PRINT_LOCK:
         print(*args, **kwargs)
+
+
+def _progress_line(done: int, total: int, t0: float, label: str = "") -> str:
+    total = max(1, total)
+    pct = 100.0 * done / total
+    width = 12
+    filled = min(width, max(0, int(round(width * done / total))))
+    bar = "█" * filled + "░" * (width - filled)
+    elapsed = time.time() - t0
+    if done > 0:
+        eta = elapsed * (total - done) / done
+        if eta < 60:
+            eta_s = f"{int(round(eta))} сек."
+        else:
+            eta_s = f"{int(round(eta / 60))} мин."
+    else:
+        eta_s = "оценка…"
+    prefix = f"{label} " if label else ""
+    return f"{prefix}[{bar}] {pct:.0f}% ({eta_s} осталось)"
 
 
 def _fmt_size(n: int) -> str:
@@ -367,6 +390,9 @@ print(f"🚀 Параллельная обработка: {len(unique_files)} ф
 
 documents: List[Tuple[str, str]] = []
 errors = []
+_t0 = time.time()
+_done = 0
+_total_files = max(1, len(unique_files))
 
 with ThreadPoolExecutor(max_workers=MAX_WORKERS) as pool:
     futures = {
@@ -381,6 +407,8 @@ with ThreadPoolExecutor(max_workers=MAX_WORKERS) as pool:
         except Exception as e:
             errors.append((name, str(e)))
             _log(f"❌ Ошибка обработки {name}: {e}")
+        _done += 1
+        _log(_progress_line(_done, _total_files, _t0, label="Индексация"))
 
 # дополнительная дедупликация документов по (basename, hash текста)
 _final_docs: List[Tuple[str, str]] = []
@@ -423,8 +451,11 @@ else:
     print(f"   Источников в индексе:        {n_sources}")
     print(f"   из них .doc:                 {len(doc_sources)}")
     print(f"   Чанков:                      {n_chunks}")
+    print(f"   chunk_size / overlap:         {CHUNK_SIZE} / {CHUNK_OVERLAP}")
+    print(f"   TOP_K (сессия):               {TOP_K}")
     print(f"   Размер словаря TF-IDF:       {vocab_size:,}")
     print(f"   Всего символов текста:       {sum(len(t) for _, t in documents):,}")
+    print(f"   Время извлечения:            {time.time() - _t0:.1f} сек.")
     if errors:
         print(f"   Ошибок обработки:            {len(errors)}")
     if doc_sources:
