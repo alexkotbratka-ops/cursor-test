@@ -1881,11 +1881,7 @@ def _extract_from_any(file_bytes: bytes, filename: str) -> List[Tuple[str, str]]
             results.extend(_extract_from_any(data, full))
         return results
 
-    # обычный файл
-    if _register_or_skip_inner(filename, file_bytes):
-        _log(f"  ⏭️ Пропуск дубликата: {_basename(filename)} (уже обработан)")
-        return results
-
+    # обычный файл (уже прошёл дедуп на уровне архива, либо это вложенный вызов)
     text = _read_document_bytes(file_bytes, filename)
     if text:
         results.append((filename, text))
@@ -1951,12 +1947,8 @@ def _process_uploaded_file(filename: str, file_bytes: bytes) -> List[Tuple[str, 
         _log("\n".join(lines))
         return extracted
 
-    # обычный файл
-    if _register_or_skip_inner(filename, file_bytes):
-        lines.append(f"   ⏭️ Пропуск дубликата: {filename} (уже обработан)")
-        _log("\n".join(lines))
-        return []
-
+    # Файл верхнего уровня: уже уникален после dedupe_uploaded (MD5 + basename).
+    # НЕ вызываем _register_or_skip_inner — иначе все upload'ы ошибочно станут «дублями».
     text = _read_document_bytes(file_bytes, filename)
     if text:
         extracted = [(filename, text)]
@@ -1987,15 +1979,12 @@ print(f"   .doc в SUPPORTED_DOCS: {'да' if _doc_ok else 'нет — пере�
 print(f"   extract_text_from_doc: {'да' if _antiword_fn else 'нет — перезапустите модуль 1'}")
 print()
 
-# дедуп верхнего уровня
+# дедуп верхнего уровня — ТОЛЬКО по MD5 / каноническому basename (реальные дубли)
 unique_files = dedupe_uploaded(dict(uploaded_files))
 
-# сбрасываем множества внутренних дублей и регистрируем уже принятые upload-хэши
+# множества внутренних дублей — ТОЛЬКО для содержимого архивов (пусто на старте)
 _SEEN_INNER_HASHES.clear()
 _SEEN_INNER_NAMES.clear()
-for _name, _data in unique_files.items():
-    _SEEN_INNER_HASHES.add(_md5(_data))
-    _SEEN_INNER_NAMES.add(_canon_basename(_name))
 
 MAX_WORKERS = min(4, max(1, len(unique_files)))
 print(f"🚀 Параллельная обработка: {len(unique_files)} файлов, workers={MAX_WORKERS}\n")
