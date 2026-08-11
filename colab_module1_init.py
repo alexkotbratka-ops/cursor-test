@@ -62,6 +62,7 @@ subprocess.check_call(
         "ezdxf",
         "python-pptx",
         "numpy",
+        "extract-msg",
     ],
     stdout=subprocess.DEVNULL,
     stderr=subprocess.STDOUT,
@@ -93,11 +94,23 @@ from bs4 import BeautifulSoup
 from docx import Document
 from openpyxl import load_workbook
 from pdf2image import convert_from_bytes
-from PIL import Image
+from PIL import Image, ImageEnhance, ImageFilter, ImageOps
 from pptx import Presentation
 from sklearn.feature_extraction.text import TfidfVectorizer
 from sklearn.metrics.pairwise import cosine_similarity
 from striprtf.striprtf import rtf_to_text
+
+try:
+    import extract_msg
+except ImportError:
+    extract_msg = None
+
+try:
+    import email
+    from email import policy as email_policy
+except ImportError:
+    email = None
+    email_policy = None
 
 try:
     import ezdxf
@@ -131,6 +144,16 @@ CHUNK_OVERLAP = 150
 TOP_K = 5
 OCR_LANG = "rus+eng"
 
+# Пороги детекции сканов / «бедного» текста
+# Раньше OCR запускался ТОЛЬКО если page.get_text() == "" — из‑за этого
+# сканы писем с мусорным/невидимым текстовым слоем или 1–2 словами
+# (номер страницы) полностью пропускали OCR.
+OCR_MIN_CHARS_PER_PAGE = 80          # меньше → страница считается сканом
+OCR_MIN_ALPHA_RATIO = 0.35           # доля букв среди непробельных символов
+OCR_IMAGE_AREA_RATIO = 0.45          # доля площади страницы под картинками
+OCR_DPI = 300                        # dpi для pdf2image / pixmap
+OCR_PDF_FORCE_FULL_IF_AVG_BELOW = 60 # средний символов/стр. → полный OCR всего PDF
+
 SUPPORTED_DOCS = {
     # документы
     ".docx",
@@ -145,12 +168,15 @@ SUPPORTED_DOCS = {
     ".htm",
     ".xml",
     ".json",
+    # почта
+    ".eml",
+    ".msg",
     # таблицы
     ".xlsx",
     ".xls",
     ".csv",
     ".ods",
-    # изображения
+    # изображения (всегда полный OCR)
     ".jpg",
     ".jpeg",
     ".png",
@@ -159,6 +185,8 @@ SUPPORTED_DOCS = {
     ".tif",
     ".tiff",
     ".webp",
+    ".jfif",
+    ".heic",
     # специфические
     ".dwg",
     ".dxf",
@@ -180,8 +208,8 @@ SUPPORTED_EXTENSIONS = SUPPORTED_DOCS | SUPPORTED_ARCHIVES
 
 
 def file_ext(filename: str) -> str:
-    """Расширение с учётом составных (.tar.gz)."""
-    name = Path(filename).name.lower()
+    """Расширение с учётом составных (.tar.gz) и Windows-путей '\\'."""
+    name = str(filename).replace("\\", "/").split("/")[-1].lower()
     if name.endswith(".tar.gz"):
         return ".tar.gz"
     if name.endswith(".tar.bz2"):
@@ -190,37 +218,182 @@ def file_ext(filename: str) -> str:
 
 
 # =============================================================================
-# 4. Извлечение текста
+# OCR helpers — полное распознавание сканов и изображений
 # =============================================================================
 
+def _preprocess_for_ocr(img: Image.Image) -> Image.Image:
+    """Улучшение читаемости сканов писем/штампов перед Tesseract."""
+    if img.mode not in ("RGB", "L"):
+        img = img.convert("RGB")
+    # увеличиваем мелкий текст (типично для фото/сканов A4)
+    w, h = img.size
+    if max(w, h) < 1600:
+        scale = 1600 / max(w, h)
+        img = img.resize((int(w * scale), int(h * scale)), Image.Resampling.LANCZOS)
+    gray = ImageOps.exif_transpose(img).convert("L")
+    gray = ImageOps.autocontrast(gray)
+    gray = ImageEnhance.Contrast(gray).enhance(1.4)
+    gray = ImageEnhance.Sharpness(gray).enhance(1.2)
+    gray = gray.filter(ImageFilter.MedianFilter(size=3))
+    return gray
+
+
+def ocr_pil_image(img: Image.Image, filename: str = "") -> str:
+    """OCR PIL-изображения: несколько PSM + предобработка."""
+    try:
+        processed = _preprocess_for_ocr(img)
+        configs = [
+            "--oem 3 --psm 6",   # блок текста (письмо)
+            "--oem 3 --psm 4",   # одна колонка
+            "--oem 3 --psm 3",   # авто
+        ]
+        best = ""
+        for cfg in configs:
+            try:
+                text = pytesseract.image_to_string(
+                    processed, lang=OCR_LANG, config=cfg
+                ).strip()
+            except Exception:
+                text = ""
+            if len(text) > len(best):
+                best = text
+        # запасной проход без препроцесса
+        if len(best) < 20:
+            try:
+                raw = img.convert("RGB") if img.mode != "RGB" else img
+                alt = pytesseract.image_to_string(raw, lang=OCR_LANG).strip()
+                if len(alt) > len(best):
+                    best = alt
+            except Exception:
+                pass
+        return best
+    except Exception as e:
+        print(f"  ⚠️ OCR изображение {filename}: {e}")
+        return ""
+
+
+def _text_quality_stats(text: str) -> Dict[str, float]:
+    text = text or ""
+    chars = len(text.strip())
+    nonspace = [c for c in text if not c.isspace()]
+    alpha = sum(1 for c in nonspace if c.isalpha())
+    alpha_ratio = (alpha / len(nonspace)) if nonspace else 0.0
+    return {"chars": float(chars), "alpha_ratio": float(alpha_ratio)}
+
+
+def _page_image_area_ratio(page) -> float:
+    """Оценка доли площади страницы, занятой встроенными изображениями."""
+    try:
+        rect = page.rect
+        page_area = abs(rect.width * rect.height) or 1.0
+        img_area = 0.0
+        for info in page.get_image_info(xrefs=True) or []:
+            bbox = info.get("bbox")
+            if not bbox:
+                continue
+            x0, y0, x1, y1 = bbox
+            img_area += abs((x1 - x0) * (y1 - y0))
+        return min(img_area / page_area, 1.0)
+    except Exception:
+        # fallback: есть ли картинки вообще
+        try:
+            return 0.8 if page.get_images(full=True) else 0.0
+        except Exception:
+            return 0.0
+
+
+def page_needs_ocr(page, digital_text: str) -> bool:
+    """
+    Решение: нужен ли OCR для страницы.
+    Срабатывает не только на пустой текст, но и на «бедный» текст /
+    страницы-сканы с картинкой на весь лист.
+    """
+    stats = _text_quality_stats(digital_text)
+    if stats["chars"] < OCR_MIN_CHARS_PER_PAGE:
+        return True
+    if stats["alpha_ratio"] < OCR_MIN_ALPHA_RATIO and stats["chars"] < 400:
+        return True
+    if _page_image_area_ratio(page) >= OCR_IMAGE_AREA_RATIO and stats["chars"] < 500:
+        return True
+    return False
+
+
+def ocr_pdf_page(page, page_no: int, filename: str = "") -> str:
+    """Рендер страницы PDF → OCR."""
+    try:
+        # 300 dpi ≈ 300/72 = 4.167
+        zoom = OCR_DPI / 72.0
+        pix = page.get_pixmap(matrix=fitz.Matrix(zoom, zoom), alpha=False)
+        img = Image.open(io.BytesIO(pix.tobytes("png")))
+        text = ocr_pil_image(img, f"{filename}#p{page_no}")
+        return text
+    except Exception as e:
+        print(f"  ⚠️ OCR страницы {page_no} ({filename}): {e}")
+        return ""
+
+
 def extract_text_from_pdf(file_bytes: bytes, filename: str = "") -> str:
-    """Извлекает текст из PDF через PyMuPDF; при пустых страницах — OCR."""
+    """
+    PDF: цифровой текст + принудительный OCR для сканов.
+    Раньше OCR был только при text=='' — сканы писем пропускались.
+    """
     parts: List[str] = []
+    ocr_pages = 0
+    digital_chars_total = 0
+    page_count = 0
+
     try:
         doc = fitz.open(stream=file_bytes, filetype="pdf")
+        page_count = doc.page_count
         for i, page in enumerate(doc, start=1):
-            text = (page.get_text("text") or "").strip()
-            if text:
-                parts.append(f"[Страница {i}]\n{text}")
+            digital = (page.get_text("text") or "").strip()
+            digital_chars_total += len(digital)
+            need_ocr = page_needs_ocr(page, digital)
+
+            page_bits: List[str] = []
+            if digital and not need_ocr:
+                page_bits.append(digital)
+            elif digital and need_ocr:
+                # гибрид: оставляем цифровой слой + дополняем OCR
+                page_bits.append(digital)
+                ocr_text = ocr_pdf_page(page, i, filename)
+                if ocr_text:
+                    ocr_pages += 1
+                    # если OCR дал существенно больше — приоритет OCR
+                    if len(ocr_text) > len(digital) * 1.2:
+                        page_bits = [f"[OCR]\n{ocr_text}"]
+                    else:
+                        page_bits.append(f"[OCR-дополнение]\n{ocr_text}")
             else:
-                try:
-                    pix = page.get_pixmap(matrix=fitz.Matrix(2, 2))
-                    img = Image.open(io.BytesIO(pix.tobytes("png")))
-                    ocr_text = pytesseract.image_to_string(img, lang=OCR_LANG).strip()
-                    if ocr_text:
-                        parts.append(f"[Страница {i} | OCR]\n{ocr_text}")
-                except Exception as e:
-                    print(f"  ⚠️ OCR страницы {i} ({filename}): {e}")
+                ocr_text = ocr_pdf_page(page, i, filename)
+                if ocr_text:
+                    ocr_pages += 1
+                    page_bits.append(f"[OCR]\n{ocr_text}")
+
+            if page_bits:
+                parts.append(f"[Страница {i}]\n" + "\n".join(page_bits))
+            else:
+                print(f"  ⚠️ Страница {i} без текста даже после OCR: {filename}")
         doc.close()
     except Exception as e:
         print(f"  ❌ Ошибка PDF {filename}: {e}")
-        ocr = ocr_pdf_bytes(file_bytes, filename)
-        if ocr:
-            return ocr
-    return "\n\n".join(parts)
+        return ocr_pdf_bytes(file_bytes, filename)
+
+    result = "\n\n".join(parts)
+
+    # Если в среднем мало символов — полный проход pdf2image @ 300 dpi
+    avg = (digital_chars_total / page_count) if page_count else 0
+    if page_count and (avg < OCR_PDF_FORCE_FULL_IF_AVG_BELOW or (ocr_pages == 0 and len(result) < OCR_MIN_CHARS_PER_PAGE * page_count)):
+        print(f"  🔍 PDF похож на скан (avg={avg:.0f} симв/стр, OCR-стр={ocr_pages}) — полный OCR: {filename}")
+        full = ocr_pdf_bytes(file_bytes, filename)
+        if len(full) > len(result):
+            return full
+
+    return result
 
 
 def extract_text_from_docx(file_bytes: bytes, filename: str = "") -> str:
+    """DOCX: текст + OCR встроенных изображений (сканы писем внутри Word)."""
     parts: List[str] = []
     try:
         doc = Document(io.BytesIO(file_bytes))
@@ -232,6 +405,25 @@ def extract_text_from_docx(file_bytes: bytes, filename: str = "") -> str:
                 cells = [c.text.strip() for c in row.cells if c.text.strip()]
                 if cells:
                     parts.append(" | ".join(cells))
+
+        # встроенные картинки (сканы внутри docx)
+        try:
+            img_idx = 0
+            for rel in doc.part.rels.values():
+                try:
+                    if "image" not in getattr(rel, "reltype", ""):
+                        continue
+                    blob = rel.target_part.blob
+                    img_idx += 1
+                    ocr_text = extract_text_from_image(blob, f"{filename}#img{img_idx}")
+                    if ocr_text:
+                        parts.append(f"[Изображение {img_idx} | OCR]\n{ocr_text}")
+                except Exception:
+                    continue
+            if img_idx:
+                print(f"  🖼️ DOCX {filename}: OCR для {img_idx} изображений")
+        except Exception as e:
+            print(f"  ⚠️ DOCX images OCR {filename}: {e}")
     except Exception as e:
         print(f"  ❌ Ошибка DOCX {filename}: {e}")
     return "\n".join(parts)
@@ -490,29 +682,265 @@ def extract_text_from_ods(file_bytes: bytes, filename: str = "") -> str:
 
 
 def extract_text_from_image(file_bytes: bytes, filename: str = "") -> str:
-    """OCR для изображений."""
+    """Полный OCR для любого изображения (скан письма, фото, штамп)."""
     try:
         img = Image.open(io.BytesIO(file_bytes))
-        if img.mode not in ("RGB", "L"):
-            img = img.convert("RGB")
-        return pytesseract.image_to_string(img, lang=OCR_LANG).strip()
+        # многостраничный TIFF
+        texts = []
+        try:
+            n = getattr(img, "n_frames", 1)
+        except Exception:
+            n = 1
+        for frame in range(max(n, 1)):
+            try:
+                if n > 1:
+                    img.seek(frame)
+                frame_img = img.copy()
+            except Exception:
+                frame_img = img
+            t = ocr_pil_image(frame_img, filename if n == 1 else f"{filename}#f{frame+1}")
+            if t:
+                if n > 1:
+                    texts.append(f"[Кадр {frame + 1}]\n{t}")
+                else:
+                    texts.append(t)
+        return "\n\n".join(texts).strip()
     except Exception as e:
         print(f"  ❌ Ошибка OCR изображения {filename}: {e}")
         return ""
 
 
 def ocr_pdf_bytes(file_bytes: bytes, filename: str = "") -> str:
-    """Полный OCR PDF через pdf2image + Tesseract."""
+    """Полный OCR PDF через pdf2image @ OCR_DPI + Tesseract."""
     parts: List[str] = []
     try:
-        images = convert_from_bytes(file_bytes, dpi=200)
+        images = convert_from_bytes(file_bytes, dpi=OCR_DPI)
+        print(f"  🔍 Полный OCR PDF ({len(images)} стр. @ {OCR_DPI} dpi): {filename}")
         for i, img in enumerate(images, start=1):
-            text = pytesseract.image_to_string(img, lang=OCR_LANG).strip()
+            text = ocr_pil_image(img, f"{filename}#p{i}")
             if text:
                 parts.append(f"[Страница {i} | OCR]\n{text}")
+            else:
+                print(f"  ⚠️ OCR пуст на стр. {i}: {filename}")
     except Exception as e:
         print(f"  ❌ OCR PDF {filename}: {e}")
     return "\n\n".join(parts)
+
+
+def extract_text_from_eml(file_bytes: bytes, filename: str = "") -> str:
+    """Разбор .eml: заголовки, тело, вложения (в т.ч. сканы)."""
+    if email is None:
+        return extract_text_fallback(file_bytes, filename)
+    parts: List[str] = []
+    try:
+        msg = email.message_from_bytes(file_bytes, policy=email_policy.default)
+        headers = []
+        for h in ("From", "To", "Cc", "Subject", "Date", "Message-ID"):
+            val = msg.get(h)
+            if val:
+                headers.append(f"{h}: {val}")
+        if headers:
+            parts.append("[Заголовки письма]\n" + "\n".join(headers))
+
+        body_texts = []
+        attachments = []
+        if msg.is_multipart():
+            for part in msg.walk():
+                ctype = part.get_content_type()
+                disp = str(part.get_content_disposition() or "")
+                name = part.get_filename() or ""
+                payload = part.get_payload(decode=True)
+                if payload is None:
+                    continue
+                if disp == "attachment" or name:
+                    attachments.append((name or f"attachment-{ctype}", payload))
+                elif ctype == "text/plain":
+                    body_texts.append(payload.decode(part.get_content_charset() or "utf-8", errors="replace"))
+                elif ctype == "text/html":
+                    body_texts.append(extract_text_from_html(payload, name or "body.html"))
+                elif ctype.startswith("image/"):
+                    attachments.append((name or f"inline.{ctype.split('/')[-1]}", payload))
+        else:
+            payload = msg.get_payload(decode=True) or b""
+            ctype = msg.get_content_type()
+            if ctype == "text/html":
+                body_texts.append(extract_text_from_html(payload, filename))
+            else:
+                body_texts.append(payload.decode(msg.get_content_charset() or "utf-8", errors="replace"))
+
+        body = "\n".join(t.strip() for t in body_texts if t and t.strip())
+        if body:
+            parts.append("[Тело письма]\n" + body)
+
+        for att_name, data in attachments:
+            print(f"  📎 EML вложение: {att_name}")
+            nested = extract_text(data, f"{filename}/{att_name}")
+            if nested.strip():
+                parts.append(f"[Вложение: {att_name}]\n{nested}")
+            else:
+                # принудительный OCR, если похоже на картинку
+                ocr = extract_text_from_image(data, att_name)
+                if ocr:
+                    parts.append(f"[Вложение OCR: {att_name}]\n{ocr}")
+    except Exception as e:
+        print(f"  ❌ Ошибка EML {filename}: {e}")
+    return "\n\n".join(parts)
+
+
+def extract_text_from_msg(file_bytes: bytes, filename: str = "") -> str:
+    """Разбор Outlook .msg: тема, тело, вложения (сканы писем/согласований)."""
+    if extract_msg is None:
+        print(f"  ❌ extract-msg не установлен — пропуск {filename}")
+        return ""
+    tmp_path = None
+    parts: List[str] = []
+    try:
+        with tempfile.NamedTemporaryFile(suffix=".msg", delete=False) as tmp:
+            tmp.write(file_bytes)
+            tmp_path = tmp.name
+        msg = extract_msg.Message(tmp_path)
+        headers = []
+        for label, attr in (
+            ("From", "sender"),
+            ("To", "to"),
+            ("Cc", "cc"),
+            ("Subject", "subject"),
+            ("Date", "date"),
+        ):
+            val = getattr(msg, attr, None)
+            if val:
+                headers.append(f"{label}: {val}")
+        if headers:
+            parts.append("[Заголовки письма]\n" + "\n".join(headers))
+        body = (getattr(msg, "body", None) or "").strip()
+        if body:
+            parts.append("[Тело письма]\n" + body)
+        # HTML-тело если body пуст
+        if not body:
+            html = getattr(msg, "htmlBody", None) or getattr(msg, "htmlBodyMsg", None)
+            if html:
+                if isinstance(html, bytes):
+                    parts.append("[Тело HTML]\n" + extract_text_from_html(html, filename))
+                else:
+                    parts.append("[Тело HTML]\n" + extract_text_from_html(str(html).encode("utf-8"), filename))
+
+        for att in getattr(msg, "attachments", []) or []:
+            try:
+                att_name = getattr(att, "longFilename", None) or getattr(att, "shortFilename", None) or "attachment"
+                data = getattr(att, "data", None)
+                if not data:
+                    continue
+                print(f"  📎 MSG вложение: {att_name}")
+                nested = extract_text(data, f"{filename}/{att_name}")
+                if nested.strip():
+                    parts.append(f"[Вложение: {att_name}]\n{nested}")
+                else:
+                    ocr = extract_text_from_image(data, att_name)
+                    if ocr:
+                        parts.append(f"[Вложение OCR: {att_name}]\n{ocr}")
+            except Exception as e:
+                print(f"  ⚠️ MSG attachment error: {e}")
+        try:
+            msg.close()
+        except Exception:
+            pass
+    except Exception as e:
+        print(f"  ❌ Ошибка MSG {filename}: {e}")
+    finally:
+        if tmp_path:
+            try:
+                os.unlink(tmp_path)
+            except OSError:
+                pass
+    return "\n\n".join(parts)
+
+
+def _looks_like_image(file_bytes: bytes) -> bool:
+    if len(file_bytes) < 8:
+        return False
+    magic = [
+        b"\xff\xd8\xff",            # jpeg
+        b"\x89PNG\r\n\x1a\n",       # png
+        b"GIF87a", b"GIF89a",       # gif
+        b"BM",                      # bmp
+        b"II*\x00", b"MM\x00*",     # tiff
+        b"RIFF",                    # webp (need WEBP later)
+    ]
+    return any(file_bytes.startswith(m) for m in magic)
+
+
+def extract_text_fallback(file_bytes: bytes, filename: str = "") -> str:
+    """Fallback: картинка → OCR; иначе попытка как текст."""
+    # неизвестный формат, но это изображение — полный OCR
+    if _looks_like_image(file_bytes):
+        print(f"  🖼️ Неизвестное расширение, но файл-изображение — OCR: {filename}")
+        return extract_text_from_image(file_bytes, filename)
+
+    print(f"  ⚠️ Неизвестный формат {filename} — пробую как текст")
+    text = extract_text_from_txt(file_bytes, filename).strip()
+    if not text:
+        # последняя попытка — OCR (вдруг скан без расширения)
+        ocr = extract_text_from_image(file_bytes, filename)
+        if ocr:
+            print(f"  🔍 Fallback OCR сработал: {filename}")
+            return ocr
+        return ""
+    printable = sum(1 for ch in text if ch.isprintable() or ch in "\n\r\t")
+    if printable / max(len(text), 1) < 0.7:
+        print(f"  🖼️ Похоже на бинарный файл — пробую OCR: {filename}")
+        ocr = extract_text_from_image(file_bytes, filename)
+        if ocr:
+            return ocr
+        print(f"  ⏭️ OCR не дал текста, пропуск: {filename}")
+        return ""
+    return text
+
+
+def extract_text(file_bytes: bytes, filename: str) -> str:
+    """Универсальное извлечение текста по расширению файла."""
+    ext = file_ext(filename)
+
+    if ext == ".pdf":
+        return extract_text_from_pdf(file_bytes, filename)
+    if ext == ".docx":
+        return extract_text_from_docx(file_bytes, filename)
+    if ext == ".doc":
+        return extract_text_from_doc(file_bytes, filename)
+    if ext == ".rtf":
+        return extract_text_from_rtf(file_bytes, filename)
+    if ext == ".odt":
+        return extract_text_from_odt(file_bytes, filename)
+    if ext in {".txt", ".log", ".md"}:
+        return extract_text_from_txt(file_bytes, filename)
+    if ext in {".html", ".htm"}:
+        return extract_text_from_html(file_bytes, filename)
+    if ext == ".xml":
+        return extract_text_from_xml(file_bytes, filename)
+    if ext == ".json":
+        return extract_text_from_json(file_bytes, filename)
+    if ext == ".xlsx":
+        return extract_text_from_xlsx(file_bytes, filename)
+    if ext == ".xls":
+        return extract_text_from_xls(file_bytes, filename)
+    if ext == ".csv":
+        return extract_text_from_csv(file_bytes, filename)
+    if ext == ".ods":
+        return extract_text_from_ods(file_bytes, filename)
+    if ext in {".jpg", ".jpeg", ".png", ".bmp", ".gif", ".tif", ".tiff", ".webp", ".jfif"}:
+        return extract_text_from_image(file_bytes, filename)
+    if ext in {".eml"}:
+        return extract_text_from_eml(file_bytes, filename)
+    if ext in {".msg"}:
+        return extract_text_from_msg(file_bytes, filename)
+    if ext in {".dwg", ".dxf"}:
+        return extract_text_from_dwg(file_bytes, filename)
+    if ext == ".pptx":
+        return extract_text_from_pptx(file_bytes, filename)
+    if ext == ".ppt":
+        return extract_text_from_ppt(file_bytes, filename)
+
+    # fallback: текст или OCR
+    return extract_text_fallback(file_bytes, filename)
 
 
 def extract_text_from_pptx(file_bytes: bytes, filename: str = "") -> str:
@@ -655,63 +1083,6 @@ def extract_text_from_dwg(file_bytes: bytes, filename: str = "") -> str:
                 os.unlink(tmp_path)
             except OSError:
                 pass
-
-
-def extract_text_fallback(file_bytes: bytes, filename: str = "") -> str:
-    """Fallback: попытка прочитать неизвестный формат как текст."""
-    print(f"  ⚠️ Неизвестный формат {filename} — пробую как текст")
-    text = extract_text_from_txt(file_bytes, filename).strip()
-    # отсекаем явный бинарный мусор
-    if not text:
-        return ""
-    printable = sum(1 for ch in text if ch.isprintable() or ch in "\n\r\t")
-    if printable / max(len(text), 1) < 0.7:
-        print(f"  ⏭️ Похоже на бинарный файл, пропуск: {filename}")
-        return ""
-    return text
-
-
-def extract_text(file_bytes: bytes, filename: str) -> str:
-    """Универсальное извлечение текста по расширению файла."""
-    ext = file_ext(filename)
-
-    if ext == ".pdf":
-        return extract_text_from_pdf(file_bytes, filename)
-    if ext == ".docx":
-        return extract_text_from_docx(file_bytes, filename)
-    if ext == ".doc":
-        return extract_text_from_doc(file_bytes, filename)
-    if ext == ".rtf":
-        return extract_text_from_rtf(file_bytes, filename)
-    if ext == ".odt":
-        return extract_text_from_odt(file_bytes, filename)
-    if ext in {".txt", ".log", ".md"}:
-        return extract_text_from_txt(file_bytes, filename)
-    if ext in {".html", ".htm"}:
-        return extract_text_from_html(file_bytes, filename)
-    if ext == ".xml":
-        return extract_text_from_xml(file_bytes, filename)
-    if ext == ".json":
-        return extract_text_from_json(file_bytes, filename)
-    if ext == ".xlsx":
-        return extract_text_from_xlsx(file_bytes, filename)
-    if ext == ".xls":
-        return extract_text_from_xls(file_bytes, filename)
-    if ext == ".csv":
-        return extract_text_from_csv(file_bytes, filename)
-    if ext == ".ods":
-        return extract_text_from_ods(file_bytes, filename)
-    if ext in {".jpg", ".jpeg", ".png", ".bmp", ".gif", ".tif", ".tiff", ".webp"}:
-        return extract_text_from_image(file_bytes, filename)
-    if ext in {".dwg", ".dxf"}:
-        return extract_text_from_dwg(file_bytes, filename)
-    if ext == ".pptx":
-        return extract_text_from_pptx(file_bytes, filename)
-    if ext == ".ppt":
-        return extract_text_from_ppt(file_bytes, filename)
-
-    # fallback для неизвестных форматов
-    return extract_text_fallback(file_bytes, filename)
 
 
 # =============================================================================
@@ -1047,11 +1418,16 @@ def ask_with_rag(question: str, top_k: int = TOP_K) -> Dict[str, Any]:
 # --- Готово ---
 print(
     "📎 Поддерживаемые форматы: "
-    "docx/doc/rtf/odt/pdf/txt/log/md/html/xml/json, "
+    "docx/doc/rtf/odt/pdf(+OCR сканов)/txt/log/md/html/xml/json, "
+    "eml/msg (+вложения OCR), "
     "xlsx/xls/csv/ods, "
-    "jpg/png/bmp/gif/tif/webp (OCR), "
+    "jpg/png/bmp/gif/tif/webp (полный OCR), "
     "zip/rar/7z/tar/gz, "
-    "dwg/dxf, ppt/pptx + fallback как текст."
+    "dwg/dxf, ppt/pptx + fallback OCR для бинарных/без расширения."
+)
+print(
+    f"🔍 OCR: порог {OCR_MIN_CHARS_PER_PAGE} симв/стр, "
+    f"доля картинки ≥{OCR_IMAGE_AREA_RATIO}, dpi={OCR_DPI}, lang={OCR_LANG}"
 )
 if DEEPSEEK_API_KEY:
     print("🔐 API-ключ DeepSeek сохранён в сессии.")
