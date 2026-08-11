@@ -427,7 +427,10 @@ class RAGIndex:
         self.matrix = None
 
 
-# Глобальный индекс сессии (модуль 2 наполнит данными)
+# Глобальное хранилище сессии:
+#   uploaded_files — модуль 2 положит сюда {имя: bytes}
+#   rag_index      — модуль 3 построит индекс после чтения
+uploaded_files = {}
 rag_index = RAGIndex()
 
 
