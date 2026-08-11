@@ -36,6 +36,46 @@ TOP_K_FORCED = 8
 MAX_CTX = 12000
 DEEPSEEK_TIMEOUT = 60                # было 120 сек.
 
+# --- Статус / таймер модуля 4 ---
+_T0_MODULE4 = time.time()
+_CURRENT_STATUS = "инициализация"
+
+
+def _fmt_elapsed(seconds: float) -> str:
+    if seconds != seconds or seconds < 0:
+        return "—"
+    seconds = int(round(seconds))
+    if seconds < 60:
+        return f"{seconds} сек."
+    m, s = divmod(seconds, 60)
+    if m < 60:
+        return f"{m} мин. {s} сек."
+    h, m = divmod(m, 60)
+    return f"{h} ч. {m} мин."
+
+
+def _status(msg: str) -> None:
+    """Текущий статус выполнения + сколько уже прошло."""
+    global _CURRENT_STATUS
+    _CURRENT_STATUS = msg
+    elapsed = time.time() - _T0_MODULE4
+    print(f"🔄 СТАТУС: {msg}  | ⏱ прошло {_fmt_elapsed(elapsed)}", flush=True)
+
+
+def _manual_download_link(filename: str) -> str:
+    """Путь для ручного скачивания в Colab (/content/...)."""
+    base = os.path.basename(filename)
+    if os.path.isdir("/content"):
+        # файл обычно пишется в cwd Colab = /content
+        abs_path = os.path.abspath(filename)
+        if abs_path.startswith("/content/"):
+            return abs_path
+        return f"/content/{base}"
+    return os.path.abspath(filename)
+
+
+_status("старт модуля 4 — подготовка индекса")
+
 # =============================================================================
 # Ожидаемые 14 файлов
 # =============================================================================
@@ -137,6 +177,7 @@ def build_dedup():
 
 
 print("🔧 Дедупликация индекса...")
+_status("дедупликация чанков индекса")
 D_CHUNKS, D_SOURCES, D_ORIG = build_dedup()
 print(f"   Чанков: {len(rag_index.chunks)} → {len(D_CHUNKS)}")
 print(f"   Уник. basename: {len({_norm(s) for s in D_SOURCES})}")
@@ -424,6 +465,7 @@ def extract_letter_requisites(display_name: str, text: str) -> Dict[str, str]:
 
 
 print("🏷️ Классификация документов по содержимому...")
+_status("классификация документов и извлечение реквизитов писем")
 FILE_CLASSIFICATION: Dict[str, Dict[str, Any]] = {}  # group_key -> meta
 APPROVALS: List[Dict[str, str]] = []
 
@@ -907,6 +949,7 @@ print(f"   Чанков после дедупа: {len(D_CHUNKS)}")
 print(f"   Вопросов: {len(QUESTIONS)}")
 print(f"   TOP_K={TOP_K}, DeepSeek timeout={DEEPSEEK_TIMEOUT}с")
 print()
+_status("анализ 86 вопросов (RAG + синтез)")
 
 tender_no = find_tender_no()
 if tender_no:
@@ -921,15 +964,7 @@ TOTAL = 86
 
 
 def _fmt_eta(seconds: float) -> str:
-    if seconds != seconds or seconds < 0:
-        return "—"
-    seconds = int(round(seconds))
-    if seconds < 60:
-        return f"{seconds} сек."
-    minutes = seconds // 60
-    if minutes < 60:
-        return f"{minutes} мин."
-    return f"{minutes // 60} ч. {minutes % 60} мин."
+    return _fmt_elapsed(seconds)
 
 
 def _progress_bar(done: int, total: int, t0: float, title: str = "") -> str:
@@ -943,9 +978,12 @@ def _progress_bar(done: int, total: int, t0: float, title: str = "") -> str:
         eta_s = _fmt_eta(elapsed * (total - done) / done)
     else:
         eta_s = "оценка…"
-    short = (title[:42] + "…") if len(title) > 43 else title
-    return f"[{bar}] {pct:.0f}% ({eta_s} осталось)  {done}/{total} {short}"
-
+    short = (title[:36] + "…") if len(title) > 37 else title
+    passed = _fmt_elapsed(time.time() - _T0_MODULE4)
+    return (
+        f"🔄 СТАТУС: вопрос {min(done + 1, total)}/{total} — {short}  | "
+        f"[{bar}] {pct:.0f}% (осталось {eta_s}, прошло {passed})"
+    )
 
 _t0_analysis = time.time()
 
@@ -1185,6 +1223,8 @@ def format_report() -> str:
     return "\n".join(lines) + "\n"
 
 
+_status("формирование TXT-отчёта")
+
 report_text = format_report()
 report_filename = build_name(tender_no)
 with open(report_filename, "w", encoding="utf-8") as f:
@@ -1196,6 +1236,10 @@ tender_number = tender_no
 tender_answers = answers
 tender_file_status = file_status_rows
 
+_manual_link = _manual_download_link(report_filename)
+_elapsed_total = time.time() - _T0_MODULE4
+
+_status("скачивание отчёта")
 if colab_files is not None:
     colab_files.download(report_filename)
 
@@ -1207,7 +1251,16 @@ print(f"⚡ Режим: TOP_K={TOP_K}, timeout={DEEPSEEK_TIMEOUT}с, ETA-бар 
 print(f"📂 Файлов использовано: {sum(1 for r in file_status_rows if r['used']=='Да')} / {len(file_status_rows)}")
 if tender_no:
     print(f"🔖 Номер тендера: {tender_no}")
-if colab_files is not None:
-    print("📥 Файл скачан.")
-else:
-    print(f"💾 {os.path.abspath(report_filename)}")
+
+print(f"\n📥 Файл скачан автоматически." if colab_files is not None else "\n💾 Автоскачивание недоступно (не Colab).")
+print(f"📁 Если скачивание не началось, скачайте вручную:")
+print(f"   🔗 {_manual_link}")
+
+print()
+print("=" * 70)
+print("⏱ ВРЕМЯ ВЫПОЛНЕНИЯ")
+print("=" * 70)
+print(f"   Итого прошло: {_fmt_elapsed(_elapsed_total)}")
+print(f"   Финальный статус: отчёт готов")
+print()
+_status("модуль 4 завершён")

@@ -40,8 +40,37 @@ def _elapsed(name_from: str, name_to: str = None) -> float:
     return b - a
 
 
+_CURRENT_STATUS = "инициализация"
+
+
+def _status(msg: str) -> None:
+    """Текущий статус выполнения + сколько уже прошло с старта модуля 5."""
+    global _CURRENT_STATUS
+    _CURRENT_STATUS = msg
+    print(
+        f"🔄 СТАТУС: {msg}  | ⏱ прошло {_fmt_dur(_elapsed('start'))}",
+        flush=True,
+    )
+
+
+def _manual_download_link(filename: str) -> str:
+    base = os.path.basename(filename) if "os" in dir() else filename
+    try:
+        import os as _os
+        base = _os.path.basename(filename)
+        if _os.path.isdir("/content"):
+            abs_path = _os.path.abspath(filename)
+            if abs_path.startswith("/content/"):
+                return abs_path
+            return f"/content/{base}"
+        return _os.path.abspath(filename)
+    except Exception:
+        return f"/content/{filename}"
+
+
 _mark("start")
 _mark("deps_start")
+_status("этап 1/5 — установка зависимостей и инициализация")
 
 # =============================================================================
 # ЭТАП 1/5 — Установка зависимостей и инициализация
@@ -1555,6 +1584,7 @@ print(f"⏱️ Этап 1: {_fmt_dur(_elapsed('deps_start', 'deps_end'))}")
 # ЭТАП 2/5 — Загрузка файлов
 # =============================================================================
 _mark("upload_start")
+_status("этап 2/5 — загрузка файлов (files.upload)")
 print("\n" + "=" * 70)
 print("ЭТАП 2/5 — Загрузка файлов")
 print("=" * 70)
@@ -1600,6 +1630,7 @@ if not uploaded_files:
 # ЭТАП 3/5 — Извлечение текста, OCR, индексация
 # =============================================================================
 _mark("index_start")
+_status("этап 3/5 — OCR / извлечение текста / индексация")
 print("\n" + "=" * 70)
 print("ЭТАП 3/5 — Извлечение текста, OCR, индексация")
 print("=" * 70)
@@ -2053,6 +2084,7 @@ print(f"⏱️ Этап 3: {_fmt_dur(_elapsed('index_start', 'index_end'))}")
 # ЭТАП 4/5 — Анализ 86 вопросов + классификация + согласования
 # =============================================================================
 _mark("analysis_start")
+_status("этап 4/5 — анализ тендера (86 вопросов)")
 print("\n" + "=" * 70)
 print("ЭТАП 4/5 — Анализ тендера (86 вопросов)")
 print("=" * 70)
@@ -2460,6 +2492,7 @@ def extract_letter_requisites(display_name: str, text: str) -> Dict[str, str]:
 
 
 print("🏷️ Классификация документов по содержимому...")
+_status("классификация документов и извлечение реквизитов писем")
 FILE_CLASSIFICATION: Dict[str, Dict[str, Any]] = {}  # group_key -> meta
 APPROVALS: List[Dict[str, str]] = []
 
@@ -2937,12 +2970,13 @@ def find_tender_no() -> str:
 # Запуск
 # =============================================================================
 
-print("🚀 Модуль 4: 86 вопросов по всем файлам тендера (ускоренный режим)")
+print("🚀 Анализ: 86 вопросов по всем файлам тендера (ускоренный режим)")
 print(f"   Уник. файлов: {len(FILE_GROUPS)}")
 print(f"   Чанков после дедупа: {len(D_CHUNKS)}")
 print(f"   Вопросов: {len(QUESTIONS)}")
 print(f"   TOP_K={TOP_K}, DeepSeek timeout={DEEPSEEK_TIMEOUT}с")
 print()
+_status("этап 4/5 — ответы на 86 вопросов")
 
 tender_no = find_tender_no()
 if tender_no:
@@ -2957,15 +2991,7 @@ TOTAL = 86
 
 
 def _fmt_eta(seconds: float) -> str:
-    if seconds != seconds or seconds < 0:
-        return "—"
-    seconds = int(round(seconds))
-    if seconds < 60:
-        return f"{seconds} сек."
-    minutes = seconds // 60
-    if minutes < 60:
-        return f"{minutes} мин."
-    return f"{minutes // 60} ч. {minutes % 60} мин."
+    return _fmt_dur(seconds)
 
 
 def _progress_bar(done: int, total: int, t0: float, title: str = "") -> str:
@@ -2979,8 +3005,12 @@ def _progress_bar(done: int, total: int, t0: float, title: str = "") -> str:
         eta_s = _fmt_eta(elapsed * (total - done) / done)
     else:
         eta_s = "оценка…"
-    short = (title[:42] + "…") if len(title) > 43 else title
-    return f"[{bar}] {pct:.0f}% ({eta_s} осталось)  {done}/{total} {short}"
+    short = (title[:36] + "…") if len(title) > 37 else title
+    passed = _fmt_dur(_elapsed("start"))
+    return (
+        f"🔄 СТАТУС: вопрос {min(done + 1, total)}/{total} — {short}  | "
+        f"[{bar}] {pct:.0f}% (осталось {eta_s}, прошло {passed})"
+    )
 
 
 _t0_analysis = time.time()
@@ -3221,14 +3251,14 @@ def format_report() -> str:
     return "\n".join(lines) + "\n"
 
 
-_mark("analysis_end")
-_mark("end")
+_status("формирование TXT-отчёта")
 
+_mark("analysis_end")
+# end отметим после скачивания — чтобы итог включал запись/download
 _t_deps = _elapsed("deps_start", "deps_end")
 _t_up = _elapsed("upload_start", "upload_end")
 _t_idx = _elapsed("index_start", "index_end")
 _t_an = _elapsed("analysis_start", "analysis_end")
-_t_all = _elapsed("start", "end")
 
 report_text = format_report()
 report_text = report_text.rstrip() + (
@@ -3239,7 +3269,6 @@ report_text = report_text.rstrip() + (
     f"2. Загрузка файлов:      {_fmt_dur(_t_up)}\n"
     f"3. OCR / индексация:     {_fmt_dur(_t_idx)}\n"
     f"4. Анализ 86 вопросов:   {_fmt_dur(_t_an)}\n"
-    f"ИТОГО:                   {_fmt_dur(_t_all)}\n"
 )
 
 report_filename = build_name(tender_no)
@@ -3251,6 +3280,15 @@ tender_report_filename = report_filename
 tender_number = tender_no
 tender_answers = answers
 tender_file_status = file_status_rows
+
+_manual_link = _manual_download_link(report_filename)
+
+_status("скачивание отчёта")
+if colab_files is not None:
+    colab_files.download(report_filename)
+
+_mark("end")
+_t_all = _elapsed("start", "end")
 tender_timings = {
     "deps": _t_deps,
     "upload": _t_up,
@@ -3259,8 +3297,12 @@ tender_timings = {
     "total": _t_all,
 }
 
-if colab_files is not None:
-    colab_files.download(report_filename)
+# допишем ИТОГО в файл
+try:
+    with open(report_filename, "a", encoding="utf-8") as f:
+        f.write(f"ИТОГО:                   {_fmt_dur(_t_all)}\n")
+except Exception:
+    pass
 
 print()
 print("✅ Отчёт сформирован!")
@@ -3270,14 +3312,15 @@ print(f"⚡ Режим: TOP_K={TOP_K}, timeout={DEEPSEEK_TIMEOUT}с, ETA-бар 
 print(f"📂 Файлов использовано: {sum(1 for r in file_status_rows if r['used']=='Да')} / {len(file_status_rows)}")
 if tender_no:
     print(f"🔖 Номер тендера: {tender_no}")
-if colab_files is not None:
-    print("📥 Файл скачан.")
-else:
-    print(f"💾 {os.path.abspath(report_filename)}")
+
+print(f"\n📥 Файл скачан автоматически." if colab_files is not None else "\n💾 Автоскачивание недоступно (не Colab).")
+print(f"📁 Если скачивание не началось, скачайте вручную:")
+print(f"   🔗 {_manual_link}")
 
 # =============================================================================
 # ЭТАП 5/5 — Сводка по времени
 # =============================================================================
+_status("этап 5/5 — сводка по времени")
 print("\n" + "=" * 70)
 print("ЭТАП 5/5 — Сводка по времени выполнения")
 print("=" * 70)
@@ -3287,5 +3330,7 @@ print(f"   3. OCR / индексация:     {_fmt_dur(_t_idx)}")
 print(f"   4. Анализ 86 вопросов:   {_fmt_dur(_t_an)}")
 print(f"   ─────────────────────────────")
 print(f"   ИТОГО:                   {_fmt_dur(_t_all)}")
+print(f"   Финальный статус:        {_CURRENT_STATUS}")
 print()
+_status("модуль 5 завершён")
 print("✅ Модуль 5 завершён.")
