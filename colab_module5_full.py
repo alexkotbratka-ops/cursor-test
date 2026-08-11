@@ -1803,8 +1803,10 @@ _DEDUP_LOCK = threading.Lock()
 
 def _register_or_skip_inner(name: str, data: bytes) -> bool:
     """
+    Дедуп ТОЛЬКО для файлов внутри архивов.
     True = это дубликат, пропустить.
     False = новый файл, зарегистрирован.
+    Не использовать для загрузок верхнего уровня (их чистит dedupe_uploaded).
     """
     h = _md5(data)
     cname = _canon_basename(name)
