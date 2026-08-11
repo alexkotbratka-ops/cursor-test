@@ -1,11 +1,88 @@
 # =============================================================================
-# МОДУЛЬ 3 — Чтение и индексация (Google Colab)
-# Выполняйте строго ПОСЛЕ модуля 2. Использует функции/переменные модуля 1:
-#   uploaded_files, extract_text, extract_text_from_doc, extract_documents_from_bytes,
-#   unpack_archive, rag_index, RAGIndex, SUPPORTED_DOCS, SUPPORTED_ARCHIVES
-# Автономный: без ручного ввода.
-# Исправлено: корректная обработка .doc (в т.ч. внутри архивов с путями Windows).
+# МОДУЛЬ 3 — Чтение и индексация (оптимизированный)
+# Выполняйте строго ПОСЛЕ модуля 2.
+# Оптимизации:
+#   1) дедупликация по basename + MD5 до обработки
+#   2) OCR: dpi=200, не гонять OCR если текст уже есть
+#   3) параллельная обработка через ThreadPoolExecutor
 # =============================================================================
+
+import hashlib
+import re
+import threading
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from typing import Dict, List, Optional, Set, Tuple
+
+
+# --- Проверки сессии ---
+if "uploaded_files" not in globals() or not uploaded_files:
+    raise RuntimeError(
+        "❌ uploaded_files пуст. Сначала выполните модуль 2 (Загрузка данных)."
+    )
+
+if "rag_index" not in globals() or not isinstance(rag_index, RAGIndex):
+    raise RuntimeError(
+        "❌ rag_index не найден. Сначала выполните модуль 1 (Запуск системы)."
+    )
+
+
+# =============================================================================
+# 1) OCR-оптимизации (переопределяем настройки модуля 1 в сессии)
+# =============================================================================
+
+# Снижаем dpi: качество почти то же, OCR заметно быстрее
+OCR_DPI = 200
+
+# Не запускать «полный» OCR всего PDF агрессивно
+OCR_PDF_FORCE_FULL_IF_AVG_BELOW = 15
+
+# OCR только если текста почти нет (быстрая проверка «уже есть текст»)
+OCR_MIN_CHARS_PER_PAGE = 25
+OCR_MIN_ALPHA_RATIO = 0.25
+OCR_IMAGE_AREA_RATIO = 0.70  # картинка должна реально доминировать
+
+
+def page_needs_ocr(page, digital_text: str) -> bool:
+    """
+    Быстрая проверка: если цифровой текст уже есть — OCR не нужен.
+    OCR только для пустых / почти пустых страниц или явных сканов.
+    """
+    text = (digital_text or "").strip()
+    if len(text) >= OCR_MIN_CHARS_PER_PAGE:
+        # текст уже извлечён — пропускаем OCR (ускорение)
+        return False
+    if not text:
+        return True
+    # очень бедный текст + большая картинка → скан
+    try:
+        rect = page.rect
+        page_area = abs(rect.width * rect.height) or 1.0
+        img_area = 0.0
+        for info in page.get_image_info(xrefs=True) or []:
+            bbox = info.get("bbox")
+            if not bbox:
+                continue
+            x0, y0, x1, y1 = bbox
+            img_area += abs((x1 - x0) * (y1 - y0))
+        ratio = min(img_area / page_area, 1.0)
+    except Exception:
+        ratio = 0.0
+    return ratio >= OCR_IMAGE_AREA_RATIO and len(text) < OCR_MIN_CHARS_PER_PAGE
+
+
+print(f"⚙️ OCR: dpi={OCR_DPI}, OCR только если текст < {OCR_MIN_CHARS_PER_PAGE} симв/стр")
+
+
+# =============================================================================
+# Утилиты
+# =============================================================================
+
+_PRINT_LOCK = threading.Lock()
+
+
+def _log(*args, **kwargs):
+    with _PRINT_LOCK:
+        print(*args, **kwargs)
 
 
 def _fmt_size(n: int) -> str:
@@ -17,17 +94,11 @@ def _fmt_size(n: int) -> str:
 
 
 def _safe_ext(filename: str) -> str:
-    """
-    Надёжное расширение файла.
-    Учитывает составные (.tar.gz) и пути Windows с '\\' внутри ZIP/RAR.
-    """
     if "file_ext" in globals():
-        # нормализуем слэши до вызова file_ext из модуля 1
         normalized = str(filename).replace("\\", "/")
         ext = file_ext(normalized)
         if ext:
             return ext
-
     name = str(filename).replace("\\", "/").split("/")[-1].lower().strip()
     if name.endswith(".tar.gz"):
         return ".tar.gz"
@@ -42,37 +113,103 @@ def _basename(filename: str) -> str:
     return str(filename).replace("\\", "/").split("/")[-1]
 
 
+def _canon_basename(filename: str) -> str:
+    """file (2).docx → file.docx (для дедупа копий Colab)."""
+    name = _basename(filename)
+    name = re.sub(r"\s*\(\d+\)(?=\.\w+$)", "", name)
+    return name.lower().strip()
+
+
+def _md5(data: bytes) -> str:
+    return hashlib.md5(data).hexdigest()
+
+
+# =============================================================================
+# 2) Дедупликация загруженных файлов
+# =============================================================================
+
+def dedupe_uploaded(files: Dict[str, bytes]) -> Dict[str, bytes]:
+    """
+    Убирает дубликаты по MD5 содержимого и по каноническому имени.
+    Печатает: ⏭️ Пропуск дубликата: ...
+    """
+    unique: Dict[str, bytes] = {}
+    seen_hash: Set[str] = set()
+    seen_name: Set[str] = set()
+    skipped = 0
+
+    # стабильный порядок
+    for name, data in files.items():
+        h = _md5(data)
+        cname = _canon_basename(name)
+
+        if h in seen_hash:
+            _log(f"⏭️ Пропуск дубликата: {name} (уже обработан, тот же хэш)")
+            skipped += 1
+            continue
+        if cname in seen_name:
+            _log(f"⏭️ Пропуск дубликата: {name} (уже обработан как «{cname}»)")
+            skipped += 1
+            continue
+
+        seen_hash.add(h)
+        seen_name.add(cname)
+        unique[name] = data
+
+    _log(f"🧹 Дедупликация: было {len(files)} → уникальных {len(unique)} (пропущено {skipped})")
+    return unique
+
+
+# Глобальные множества для дедупа внутри архивов (на весь прогон модуля 3)
+_SEEN_INNER_HASHES: Set[str] = set()
+_SEEN_INNER_NAMES: Set[str] = set()
+_DEDUP_LOCK = threading.Lock()
+
+
+def _register_or_skip_inner(name: str, data: bytes) -> bool:
+    """
+    True = это дубликат, пропустить.
+    False = новый файл, зарегистрирован.
+    """
+    h = _md5(data)
+    cname = _canon_basename(name)
+    with _DEDUP_LOCK:
+        if h in _SEEN_INNER_HASHES:
+            return True
+        if cname in _SEEN_INNER_NAMES:
+            return True
+        _SEEN_INNER_HASHES.add(h)
+        _SEEN_INNER_NAMES.add(cname)
+        return False
+
+
+# =============================================================================
+# Извлечение текста
+# =============================================================================
+
 def _read_document_bytes(file_bytes: bytes, filename: str) -> str:
-    """
-    Извлекает текст из одного документа.
-    Для .doc явно вызывает extract_text_from_doc (antiword),
-    чтобы не зависеть от устаревшей версии extract_text в сессии.
-    """
     ext = _safe_ext(filename)
-    # для antiword/временных файлов лучше короткое имя с правильным суффиксом
     clean_name = _basename(filename) or f"document{ext}"
 
     if ext == ".doc":
         text = ""
-        # 1) явный вызов antiword-экстрактора из модуля 1
         if "extract_text_from_doc" in globals():
             try:
                 text = extract_text_from_doc(file_bytes, clean_name) or ""
             except Exception as e:
-                print(f"  ⚠️ extract_text_from_doc({clean_name}): {e}")
-        # 2) запасной путь через универсальный extract_text
+                _log(f"  ⚠️ extract_text_from_doc({clean_name}): {e}")
         if not (text or "").strip() and "extract_text" in globals():
             try:
                 text = extract_text(file_bytes, clean_name) or ""
             except Exception as e:
-                print(f"  ⚠️ extract_text({clean_name}): {e}")
+                _log(f"  ⚠️ extract_text({clean_name}): {e}")
         return (text or "").strip()
 
     if "extract_text" in globals():
         try:
             return (extract_text(file_bytes, clean_name) or "").strip()
         except Exception as e:
-            print(f"  ⚠️ extract_text({clean_name}): {e}")
+            _log(f"  ⚠️ extract_text({clean_name}): {e}")
             return ""
     return ""
 
@@ -81,31 +218,37 @@ def _status_label(ext: str, ok: bool) -> str:
     if ok:
         if ext == ".doc":
             return "прочитан (.doc / antiword)"
-        if ext in SUPPORTED_DOCS:
+        if "SUPPORTED_DOCS" in globals() and ext in SUPPORTED_DOCS:
             return "прочитан"
         return "прочитан (fallback)"
     if ext == ".doc":
-        return "пропущен (.doc: antiword не извлёк текст — проверьте модуль 1 / antiword)"
+        return "пропущен (.doc: antiword не извлёк текст)"
     return "пропущен (пустой текст / не удалось прочитать)"
 
 
-def _extract_from_any(file_bytes: bytes, filename: str):
-    """
-    Рекурсивно извлекает документы из файла или архива.
-    Не зависит от Path.suffix и корректно обрабатывает .doc.
-    """
+def _extract_from_any(file_bytes: bytes, filename: str) -> List[Tuple[str, str]]:
+    """Рекурсивно извлекает документы; дубликаты внутри архивов пропускает."""
     ext = _safe_ext(filename)
-    results = []
+    results: List[Tuple[str, str]] = []
 
     if ext in SUPPORTED_ARCHIVES:
         try:
             members = unpack_archive(file_bytes, filename)
         except Exception as e:
-            print(f"  ❌ Ошибка распаковки {filename}: {e}")
+            _log(f"  ❌ Ошибка распаковки {filename}: {e}")
             return results
         for inner_name, data in members:
             inner_norm = str(inner_name).replace("\\", "/")
-            results.extend(_extract_from_any(data, f"{filename}/{inner_norm}"))
+            full = f"{filename}/{inner_norm}"
+            if _register_or_skip_inner(inner_norm, data):
+                _log(f"  ⏭️ Пропуск дубликата: {inner_norm} (уже обработан)")
+                continue
+            results.extend(_extract_from_any(data, full))
+        return results
+
+    # обычный файл
+    if _register_or_skip_inner(filename, file_bytes):
+        _log(f"  ⏭️ Пропуск дубликата: {_basename(filename)} (уже обработан)")
         return results
 
     text = _read_document_bytes(file_bytes, filename)
@@ -114,31 +257,29 @@ def _extract_from_any(file_bytes: bytes, filename: str):
     return results
 
 
-def _process_uploaded_file(filename: str, file_bytes: bytes):
-    """
-    Читает один загруженный файл (или архив).
-    Возвращает список (source, text) и печатает подробный отчёт.
-    """
+def _process_uploaded_file(filename: str, file_bytes: bytes) -> List[Tuple[str, str]]:
+    """Читает один загруженный файл/архив. Потокобезопасно по логам."""
     ext = _safe_ext(filename)
     size = len(file_bytes)
-    extracted = []
+    extracted: List[Tuple[str, str]] = []
 
-    print("=" * 80)
-    print(f"📄 Файл: {filename}")
-    print(f"   Размер: {_fmt_size(size)}")
-    print(f"   Тип: {'архив ' + ext if ext in SUPPORTED_ARCHIVES else ext or '(без расширения)'}")
+    lines = [
+        "=" * 80,
+        f"📄 Файл: {filename}",
+        f"   Размер: {_fmt_size(size)}",
+        f"   Тип: {'архив ' + ext if ext in SUPPORTED_ARCHIVES else ext or '(без расширения)'}",
+    ]
 
-    # ----- Архив -----
     if ext in SUPPORTED_ARCHIVES:
-        print("   Содержимое архива:")
+        lines.append("   Содержимое архива:")
         try:
             members = unpack_archive(file_bytes, filename)
         except Exception as e:
-            print(f"   ❌ Не удалось открыть архив: {e}")
+            lines.append(f"   ❌ Не удалось открыть архив: {e}")
             members = []
 
         if not members:
-            print("   ⚠️ Архив пуст или не удалось прочитать.")
+            lines.append("   ⚠️ Архив пуст или не удалось прочитать.")
         else:
             for inner_name, data in members:
                 inner_norm = str(inner_name).replace("\\", "/")
@@ -146,36 +287,45 @@ def _process_uploaded_file(filename: str, file_bytes: bytes):
                 prefix = f"   • {inner_norm} [{_fmt_size(len(data))}]"
                 source = f"{filename}/{inner_norm}"
 
+                if _register_or_skip_inner(inner_norm, data):
+                    lines.append(f"{prefix} → ⏭️ Пропуск дубликата: {inner_norm} (уже обработан)")
+                    continue
+
                 if inner_ext in SUPPORTED_ARCHIVES:
                     nested = _extract_from_any(data, source)
                     extracted.extend(nested)
                     if nested:
                         chars = sum(len(t) for _, t in nested)
-                        print(
+                        lines.append(
                             f"{prefix} → вложенный архив, извлечено {len(nested)} док., {chars:,} символов"
                         )
                     else:
-                        print(f"{prefix} → вложенный архив, пропущен (пусто / ошибка)")
+                        lines.append(f"{prefix} → вложенный архив, пусто / только дубли")
                     continue
 
                 text = _read_document_bytes(data, inner_norm)
                 if text:
                     extracted.append((source, text))
-                    print(f"{prefix} → {_status_label(inner_ext, True)} ({len(text):,} символов)")
+                    lines.append(f"{prefix} → {_status_label(inner_ext, True)} ({len(text):,} символов)")
                 else:
-                    print(f"{prefix} → {_status_label(inner_ext, False)}")
+                    lines.append(f"{prefix} → {_status_label(inner_ext, False)}")
 
         docs_count = len(extracted)
         chars_total = sum(len(t) for _, t in extracted)
-        print(f"   Итого по архиву: документов={docs_count}, символов={chars_total:,}")
+        lines.append(f"   Итого по архиву: документов={docs_count}, символов={chars_total:,}")
+        _log("\n".join(lines))
         return extracted
 
-    # ----- Обычный файл (включая .doc) -----
+    # обычный файл
+    if _register_or_skip_inner(filename, file_bytes):
+        lines.append(f"   ⏭️ Пропуск дубликата: {filename} (уже обработан)")
+        _log("\n".join(lines))
+        return []
+
     text = _read_document_bytes(file_bytes, filename)
     if text:
         extracted = [(filename, text)]
     else:
-        # запасной путь через модуль 1
         try:
             extracted = extract_documents_from_bytes(file_bytes, filename) or []
         except Exception:
@@ -183,35 +333,69 @@ def _process_uploaded_file(filename: str, file_bytes: bytes):
 
     docs_count = len(extracted)
     chars_total = sum(len(t) for _, t in extracted)
-    print(f"   Статус: {_status_label(ext, docs_count > 0)}")
-    print(f"   Документов извлечено: {docs_count}")
-    print(f"   Символов: {chars_total:,}")
+    lines.append(f"   Статус: {_status_label(ext, docs_count > 0)}")
+    lines.append(f"   Документов извлечено: {docs_count}")
+    lines.append(f"   Символов: {chars_total:,}")
+    _log("\n".join(lines))
     return extracted
 
 
-# --- Проверки сессии ---
-if "uploaded_files" not in globals() or not uploaded_files:
-    raise RuntimeError(
-        "❌ uploaded_files пуст. Сначала выполните модуль 2 (Загрузка данных)."
-    )
+# =============================================================================
+# 3) Параллельный запуск
+# =============================================================================
 
-if "rag_index" not in globals() or not isinstance(rag_index, RAGIndex):
-    raise RuntimeError(
-        "❌ rag_index не найден. Сначала выполните модуль 1 (Запуск системы)."
-    )
-
-# Диагностика поддержки .doc в сессии (модуль 1)
 _doc_ok = ".doc" in SUPPORTED_DOCS if "SUPPORTED_DOCS" in globals() else False
 _antiword_fn = "extract_text_from_doc" in globals()
-print(f"🔍 Чтение и индексация: файлов к обработке — {len(uploaded_files)}")
+
+print(f"🔍 Чтение и индексация")
 print(f"   .doc в SUPPORTED_DOCS: {'да' if _doc_ok else 'нет — перезапустите модуль 1'}")
 print(f"   extract_text_from_doc: {'да' if _antiword_fn else 'нет — перезапустите модуль 1'}")
 print()
 
-documents = []
-for name, data in uploaded_files.items():
-    docs = _process_uploaded_file(name, data)
-    documents.extend(docs)
+# дедуп верхнего уровня
+unique_files = dedupe_uploaded(dict(uploaded_files))
+
+# сбрасываем множества внутренних дублей и регистрируем уже принятые upload-хэши
+_SEEN_INNER_HASHES.clear()
+_SEEN_INNER_NAMES.clear()
+for _name, _data in unique_files.items():
+    _SEEN_INNER_HASHES.add(_md5(_data))
+    _SEEN_INNER_NAMES.add(_canon_basename(_name))
+
+MAX_WORKERS = min(4, max(1, len(unique_files)))
+print(f"🚀 Параллельная обработка: {len(unique_files)} файлов, workers={MAX_WORKERS}\n")
+
+documents: List[Tuple[str, str]] = []
+errors = []
+
+with ThreadPoolExecutor(max_workers=MAX_WORKERS) as pool:
+    futures = {
+        pool.submit(_process_uploaded_file, name, data): name
+        for name, data in unique_files.items()
+    }
+    for fut in as_completed(futures):
+        name = futures[fut]
+        try:
+            docs = fut.result()
+            documents.extend(docs)
+        except Exception as e:
+            errors.append((name, str(e)))
+            _log(f"❌ Ошибка обработки {name}: {e}")
+
+# дополнительная дедупликация документов по (basename, hash текста)
+_final_docs: List[Tuple[str, str]] = []
+_seen_doc: Set[str] = set()
+dup_docs = 0
+for source, text in documents:
+    key = _canon_basename(source) + "::" + hashlib.md5(text.encode("utf-8", errors="ignore")).hexdigest()
+    if key in _seen_doc:
+        dup_docs += 1
+        continue
+    _seen_doc.add(key)
+    _final_docs.append((source, text))
+documents = _final_docs
+if dup_docs:
+    print(f"\n🧹 Убрано дублирующих документов после извлечения: {dup_docs}")
 
 print("\n" + "=" * 80)
 print("📚 Сборка индекса TF-IDF...")
@@ -230,17 +414,19 @@ else:
         except Exception:
             vocab_size = 0
 
-    # отдельно покажем, сколько .doc попало в индекс
     doc_sources = [s for s in set(rag_index.sources) if _safe_ext(s) == ".doc"]
     print("\n📊 Итоговая статистика")
     print("-" * 40)
-    print(f"   Загружено файлов (модуль 2): {len(uploaded_files)}")
+    print(f"   Загружено (модуль 2):        {len(uploaded_files)}")
+    print(f"   Уникальных после дедупа:     {len(unique_files)}")
     print(f"   Извлечено документов:        {len(documents)}")
     print(f"   Источников в индексе:        {n_sources}")
     print(f"   из них .doc:                 {len(doc_sources)}")
     print(f"   Чанков:                      {n_chunks}")
     print(f"   Размер словаря TF-IDF:       {vocab_size:,}")
     print(f"   Всего символов текста:       {sum(len(t) for _, t in documents):,}")
+    if errors:
+        print(f"   Ошибок обработки:            {len(errors)}")
     if doc_sources:
         print("   .doc источники:")
         for s in sorted(doc_sources):

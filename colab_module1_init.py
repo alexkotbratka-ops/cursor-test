@@ -151,8 +151,8 @@ OCR_LANG = "rus+eng"
 OCR_MIN_CHARS_PER_PAGE = 80          # меньше → страница считается сканом
 OCR_MIN_ALPHA_RATIO = 0.35           # доля букв среди непробельных символов
 OCR_IMAGE_AREA_RATIO = 0.45          # доля площади страницы под картинками
-OCR_DPI = 300                        # dpi для pdf2image / pixmap
-OCR_PDF_FORCE_FULL_IF_AVG_BELOW = 60 # средний символов/стр. → полный OCR всего PDF
+OCR_DPI = 200                        # dpi для pdf2image / pixmap (баланс скорость/качество)
+OCR_PDF_FORCE_FULL_IF_AVG_BELOW = 25 # средний символов/стр. → полный OCR всего PDF
 
 SUPPORTED_DOCS = {
     # документы
