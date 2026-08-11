@@ -20,7 +20,7 @@ def _process_uploaded_file(filename: str, file_bytes: bytes):
     Читает один загруженный файл (или архив).
     Возвращает список (source, text) и печатает подробный отчёт.
     """
-    ext = Path(filename).suffix.lower()
+    ext = file_ext(filename) if "file_ext" in globals() else Path(filename).suffix.lower()
     size = len(file_bytes)
     extracted = []
 
@@ -41,7 +41,11 @@ def _process_uploaded_file(filename: str, file_bytes: bytes):
             print("   ⚠️ Архив пуст или не удалось прочитать.")
         else:
             for inner_name, data in members:
-                inner_ext = Path(inner_name).suffix.lower()
+                inner_ext = (
+                    file_ext(inner_name)
+                    if "file_ext" in globals()
+                    else Path(inner_name).suffix.lower()
+                )
                 prefix = f"   • {inner_name} [{_fmt_size(len(data))}]"
 
                 if inner_ext in SUPPORTED_ARCHIVES:
@@ -54,15 +58,13 @@ def _process_uploaded_file(filename: str, file_bytes: bytes):
                         print(f"{prefix} → вложенный архив, пропущен (пусто / ошибка)")
                     continue
 
-                if inner_ext not in SUPPORTED_DOCS:
-                    print(f"{prefix} → пропущен (неподдерживаемый формат)")
-                    continue
-
+                # известные форматы + fallback через extract_text()
                 text = extract_text(data, inner_name)
                 if text.strip():
                     source = f"{filename}/{inner_name}"
                     extracted.append((source, text))
-                    print(f"{prefix} → прочитан ({len(text):,} символов)")
+                    status = "прочитан" if inner_ext in SUPPORTED_DOCS else "прочитан (fallback)"
+                    print(f"{prefix} → {status} ({len(text):,} символов)")
                 else:
                     print(f"{prefix} → пропущен (пустой текст / не удалось прочитать)")
 
@@ -71,14 +73,12 @@ def _process_uploaded_file(filename: str, file_bytes: bytes):
         print(f"   Итого по архиву: документов={docs_count}, символов={chars_total:,}")
         return extracted
 
-    # Обычный (неархивный) файл
+    # Обычный (неархивный) файл — включая fallback для неизвестных форматов
     extracted = extract_documents_from_bytes(file_bytes, filename)
     docs_count = len(extracted)
     chars_total = sum(len(t) for _, t in extracted)
     if docs_count:
-        status = "прочитан"
-    elif ext not in SUPPORTED_DOCS:
-        status = "пропущен (неподдерживаемый формат)"
+        status = "прочитан" if ext in SUPPORTED_DOCS else "прочитан (fallback)"
     else:
         status = "пропущен (пустой текст / не удалось прочитать)"
     print(f"   Статус: {status}")

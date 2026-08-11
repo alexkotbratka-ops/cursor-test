@@ -1,5 +1,6 @@
 # =============================================================================
 # МОДУЛЬ 1 — Запуск системы анализа документов (Google Colab)
+# Поддержка форматов, типичных для тендерной документации.
 # Скопируйте ВЕСЬ код ниже в одну ячейку Colab и выполните.
 # =============================================================================
 
@@ -17,7 +18,7 @@ def _run(cmd, check=False):
     )
 
 
-print("📦 Установка системных пакетов (tesseract, poppler, unrar, p7zip, antiword)...")
+print("📦 Установка системных пакетов...")
 _run(["apt-get", "update", "-qq"])
 _run(
     [
@@ -25,16 +26,15 @@ _run(
         "install",
         "-y",
         "-qq",
+        "antiword",
         "tesseract-ocr",
         "tesseract-ocr-rus",
         "tesseract-ocr-eng",
         "poppler-utils",
         "unrar",
         "p7zip-full",
-        "antiword",
     ]
 )
-_run(["apt-get", "install", "-y", "-qq", "antiword"])
 
 print("📦 Установка Python-библиотек...")
 subprocess.check_call(
@@ -47,6 +47,11 @@ subprocess.check_call(
         "pymupdf",
         "python-docx",
         "openpyxl",
+        "xlrd",
+        "odfpy",
+        "striprtf",
+        "beautifulsoup4",
+        "lxml",
         "pytesseract",
         "pdf2image",
         "Pillow",
@@ -54,6 +59,8 @@ subprocess.check_call(
         "requests",
         "rarfile",
         "py7zr",
+        "ezdxf",
+        "python-pptx",
         "numpy",
     ],
     stdout=subprocess.DEVNULL,
@@ -62,11 +69,16 @@ subprocess.check_call(
 print("✅ Зависимости установлены.\n")
 
 # --- 2. Импорты ---
+import csv
+import gzip
 import io
+import json
 import os
 import re
-import zipfile
+import tarfile
 import tempfile
+import zipfile
+import xml.etree.ElementTree as ET
 from getpass import getpass
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
@@ -77,12 +89,35 @@ import py7zr
 import pytesseract
 import rarfile
 import requests
+from bs4 import BeautifulSoup
 from docx import Document
 from openpyxl import load_workbook
 from pdf2image import convert_from_bytes
 from PIL import Image
+from pptx import Presentation
 from sklearn.feature_extraction.text import TfidfVectorizer
 from sklearn.metrics.pairwise import cosine_similarity
+from striprtf.striprtf import rtf_to_text
+
+try:
+    import ezdxf
+    from ezdxf import recover as ezdxf_recover
+except ImportError:
+    ezdxf = None
+    ezdxf_recover = None
+
+try:
+    from odf.opendocument import load as odf_load
+    from odf import text as odf_text
+    from odf import table as odf_table
+    from odf.teletype import extractText as odf_extract_text
+except ImportError:
+    odf_load = None
+
+try:
+    import xlrd
+except ImportError:
+    xlrd = None
 
 # --- 3. API-ключ DeepSeek (сохраняется в переменной сессии) ---
 DEEPSEEK_API_KEY = getpass("🔑 Введите API-ключ DeepSeek: ").strip()
@@ -97,24 +132,61 @@ TOP_K = 5
 OCR_LANG = "rus+eng"
 
 SUPPORTED_DOCS = {
-    ".pdf",
+    # документы
     ".docx",
     ".doc",
+    ".rtf",
+    ".odt",
+    ".pdf",
+    ".txt",
+    ".log",
+    ".md",
+    ".html",
+    ".htm",
+    ".xml",
+    ".json",
+    # таблицы
     ".xlsx",
     ".xls",
-    ".txt",
-    ".md",
     ".csv",
-    ".png",
+    ".ods",
+    # изображения
     ".jpg",
     ".jpeg",
+    ".png",
+    ".bmp",
+    ".gif",
     ".tif",
     ".tiff",
-    ".bmp",
     ".webp",
+    # специфические
+    ".dwg",
+    ".dxf",
+    ".ppt",
+    ".pptx",
 }
-SUPPORTED_ARCHIVES = {".zip", ".rar", ".7z"}
+
+SUPPORTED_ARCHIVES = {
+    ".zip",
+    ".rar",
+    ".7z",
+    ".tar",
+    ".gz",
+    ".tgz",
+    ".tar.gz",
+}
+
 SUPPORTED_EXTENSIONS = SUPPORTED_DOCS | SUPPORTED_ARCHIVES
+
+
+def file_ext(filename: str) -> str:
+    """Расширение с учётом составных (.tar.gz)."""
+    name = Path(filename).name.lower()
+    if name.endswith(".tar.gz"):
+        return ".tar.gz"
+    if name.endswith(".tar.bz2"):
+        return ".tar.bz2"
+    return Path(name).suffix.lower()
 
 
 # =============================================================================
@@ -142,7 +214,6 @@ def extract_text_from_pdf(file_bytes: bytes, filename: str = "") -> str:
         doc.close()
     except Exception as e:
         print(f"  ❌ Ошибка PDF {filename}: {e}")
-        # запасной путь: весь PDF через pdf2image + OCR
         ocr = ocr_pdf_bytes(file_bytes, filename)
         if ocr:
             return ocr
@@ -179,10 +250,8 @@ def extract_text_from_doc(file_bytes: bytes, filename: str = "") -> str:
             capture_output=True,
             check=False,
         )
-        # antiword может отдать текст в stdout даже при ненулевом коде
         raw = result.stdout or b""
-        if not raw and result.stderr:
-            # повтор без карты UTF-8 (на части систем её нет)
+        if not raw:
             result = subprocess.run(
                 ["antiword", tmp_path],
                 capture_output=True,
@@ -215,6 +284,116 @@ def extract_text_from_doc(file_bytes: bytes, filename: str = "") -> str:
                 pass
 
 
+def extract_text_from_rtf(file_bytes: bytes, filename: str = "") -> str:
+    try:
+        raw = None
+        for encoding in ("utf-8", "cp1251", "latin-1"):
+            try:
+                raw = file_bytes.decode(encoding)
+                break
+            except UnicodeDecodeError:
+                continue
+        if raw is None:
+            raw = file_bytes.decode("latin-1", errors="replace")
+        return (rtf_to_text(raw) or "").strip()
+    except Exception as e:
+        print(f"  ❌ Ошибка RTF {filename}: {e}")
+        return ""
+
+
+def extract_text_from_odt(file_bytes: bytes, filename: str = "") -> str:
+    if odf_load is None:
+        print(f"  ❌ odfpy не установлен — пропуск {filename}")
+        return ""
+    tmp_path = None
+    try:
+        with tempfile.NamedTemporaryFile(suffix=".odt", delete=False) as tmp:
+            tmp.write(file_bytes)
+            tmp_path = tmp.name
+        doc = odf_load(tmp_path)
+        parts: List[str] = []
+        for el in doc.getElementsByType(odf_text.P) + doc.getElementsByType(odf_text.H):
+            t = odf_extract_text(el).strip()
+            if t:
+                parts.append(t)
+        for table in doc.getElementsByType(odf_table.Table):
+            for row in table.getElementsByType(odf_table.TableRow):
+                cells = []
+                for cell in row.getElementsByType(odf_table.TableCell):
+                    ct = odf_extract_text(cell).strip()
+                    if ct:
+                        cells.append(ct)
+                if cells:
+                    parts.append(" | ".join(cells))
+        return "\n".join(parts)
+    except Exception as e:
+        print(f"  ❌ Ошибка ODT {filename}: {e}")
+        return ""
+    finally:
+        if tmp_path:
+            try:
+                os.unlink(tmp_path)
+            except OSError:
+                pass
+
+
+def extract_text_from_txt(file_bytes: bytes, filename: str = "") -> str:
+    for encoding in ("utf-8", "utf-16", "cp1251", "latin-1"):
+        try:
+            return file_bytes.decode(encoding)
+        except UnicodeDecodeError:
+            continue
+    return file_bytes.decode("latin-1", errors="replace")
+
+
+def extract_text_from_html(file_bytes: bytes, filename: str = "") -> str:
+    try:
+        raw = extract_text_from_txt(file_bytes, filename)
+        soup = BeautifulSoup(raw, "lxml")
+        for tag in soup(["script", "style", "noscript"]):
+            tag.decompose()
+        text = soup.get_text(separator="\n")
+        lines = [ln.strip() for ln in text.splitlines()]
+        return "\n".join(ln for ln in lines if ln)
+    except Exception as e:
+        print(f"  ❌ Ошибка HTML {filename}: {e}")
+        return ""
+
+
+def extract_text_from_xml(file_bytes: bytes, filename: str = "") -> str:
+    try:
+        raw = extract_text_from_txt(file_bytes, filename)
+        root = ET.fromstring(raw)
+        parts: List[str] = []
+
+        def walk(node, path=""):
+            tag = node.tag.split("}")[-1] if isinstance(node.tag, str) else str(node.tag)
+            cur = f"{path}/{tag}" if path else tag
+            if node.text and node.text.strip():
+                parts.append(f"{cur}: {node.text.strip()}")
+            for child in list(node):
+                walk(child, cur)
+            if node.tail and node.tail.strip():
+                parts.append(node.tail.strip())
+
+        walk(root)
+        return "\n".join(parts)
+    except Exception as e:
+        print(f"  ❌ Ошибка XML {filename}: {e}")
+        # fallback: как текст
+        return extract_text_from_txt(file_bytes, filename)
+
+
+def extract_text_from_json(file_bytes: bytes, filename: str = "") -> str:
+    try:
+        raw = extract_text_from_txt(file_bytes, filename)
+        data = json.loads(raw)
+        return json.dumps(data, ensure_ascii=False, indent=2)
+    except Exception as e:
+        print(f"  ❌ Ошибка JSON {filename}: {e}")
+        return extract_text_from_txt(file_bytes, filename)
+
+
 def extract_text_from_xlsx(file_bytes: bytes, filename: str = "") -> str:
     parts: List[str] = []
     try:
@@ -231,19 +410,91 @@ def extract_text_from_xlsx(file_bytes: bytes, filename: str = "") -> str:
     return "\n".join(parts)
 
 
-def extract_text_from_txt(file_bytes: bytes, filename: str = "") -> str:
-    for encoding in ("utf-8", "cp1251", "latin-1"):
+def extract_text_from_xls(file_bytes: bytes, filename: str = "") -> str:
+    if xlrd is None:
+        print(f"  ❌ xlrd не установлен — пропуск {filename}")
+        return ""
+    parts: List[str] = []
+    try:
+        book = xlrd.open_workbook(file_contents=file_bytes)
+        for sheet in book.sheets():
+            parts.append(f"[Лист: {sheet.name}]")
+            for r in range(sheet.nrows):
+                cells = []
+                for c in range(sheet.ncols):
+                    val = sheet.cell_value(r, c)
+                    if val is None or val == "":
+                        continue
+                    cells.append(str(val).strip())
+                if cells:
+                    parts.append(" | ".join(cells))
+    except Exception as e:
+        print(f"  ❌ Ошибка XLS {filename}: {e}")
+    return "\n".join(parts)
+
+
+def extract_text_from_csv(file_bytes: bytes, filename: str = "") -> str:
+    try:
+        raw = extract_text_from_txt(file_bytes, filename)
+        # автоопределение разделителя
+        sample = raw[:4096]
         try:
-            return file_bytes.decode(encoding)
-        except UnicodeDecodeError:
-            continue
-    return file_bytes.decode("latin-1", errors="replace")
+            dialect = csv.Sniffer().sniff(sample, delimiters=";,\t|")
+        except Exception:
+            dialect = csv.excel
+            dialect.delimiter = ";" if sample.count(";") > sample.count(",") else ","
+        reader = csv.reader(io.StringIO(raw), dialect)
+        rows = []
+        for row in reader:
+            cells = [c.strip() for c in row if c and c.strip()]
+            if cells:
+                rows.append(" | ".join(cells))
+        return "\n".join(rows)
+    except Exception as e:
+        print(f"  ❌ Ошибка CSV {filename}: {e}")
+        return extract_text_from_txt(file_bytes, filename)
+
+
+def extract_text_from_ods(file_bytes: bytes, filename: str = "") -> str:
+    if odf_load is None:
+        print(f"  ❌ odfpy не установлен — пропуск {filename}")
+        return ""
+    tmp_path = None
+    try:
+        with tempfile.NamedTemporaryFile(suffix=".ods", delete=False) as tmp:
+            tmp.write(file_bytes)
+            tmp_path = tmp.name
+        doc = odf_load(tmp_path)
+        parts: List[str] = []
+        for table in doc.getElementsByType(odf_table.Table):
+            name = table.getAttribute("name") or "Sheet"
+            parts.append(f"[Лист: {name}]")
+            for row in table.getElementsByType(odf_table.TableRow):
+                cells = []
+                for cell in row.getElementsByType(odf_table.TableCell):
+                    ct = odf_extract_text(cell).strip()
+                    if ct:
+                        cells.append(ct)
+                if cells:
+                    parts.append(" | ".join(cells))
+        return "\n".join(parts)
+    except Exception as e:
+        print(f"  ❌ Ошибка ODS {filename}: {e}")
+        return ""
+    finally:
+        if tmp_path:
+            try:
+                os.unlink(tmp_path)
+            except OSError:
+                pass
 
 
 def extract_text_from_image(file_bytes: bytes, filename: str = "") -> str:
-    """OCR для изображений (PNG/JPG/TIFF и т.д.)."""
+    """OCR для изображений."""
     try:
         img = Image.open(io.BytesIO(file_bytes))
+        if img.mode not in ("RGB", "L"):
+            img = img.convert("RGB")
         return pytesseract.image_to_string(img, lang=OCR_LANG).strip()
     except Exception as e:
         print(f"  ❌ Ошибка OCR изображения {filename}: {e}")
@@ -264,26 +515,207 @@ def ocr_pdf_bytes(file_bytes: bytes, filename: str = "") -> str:
     return "\n\n".join(parts)
 
 
+def extract_text_from_pptx(file_bytes: bytes, filename: str = "") -> str:
+    parts: List[str] = []
+    try:
+        prs = Presentation(io.BytesIO(file_bytes))
+        for i, slide in enumerate(prs.slides, start=1):
+            slide_parts: List[str] = []
+            for shape in slide.shapes:
+                if hasattr(shape, "text") and shape.text and shape.text.strip():
+                    slide_parts.append(shape.text.strip())
+                if shape.has_table:
+                    table = shape.table
+                    for row in table.rows:
+                        cells = [c.text.strip() for c in row.cells if c.text and c.text.strip()]
+                        if cells:
+                            slide_parts.append(" | ".join(cells))
+            if slide_parts:
+                parts.append(f"[Слайд {i}]\n" + "\n".join(slide_parts))
+    except Exception as e:
+        print(f"  ❌ Ошибка PPTX {filename}: {e}")
+    return "\n\n".join(parts)
+
+
+def extract_text_from_ppt(file_bytes: bytes, filename: str = "") -> str:
+    """
+    Старый .ppt: python-pptx не читает бинарный PPT.
+    Пробуем catppt (если есть) или fallback как текст.
+    """
+    tmp_path = None
+    try:
+        with tempfile.NamedTemporaryFile(suffix=".ppt", delete=False) as tmp:
+            tmp.write(file_bytes)
+            tmp_path = tmp.name
+        result = subprocess.run(
+            ["catppt", tmp_path],
+            capture_output=True,
+            check=False,
+        )
+        raw = result.stdout or b""
+        if raw:
+            for encoding in ("utf-8", "cp1251", "latin-1"):
+                try:
+                    return raw.decode(encoding).strip()
+                except UnicodeDecodeError:
+                    continue
+            return raw.decode("latin-1", errors="replace").strip()
+    except FileNotFoundError:
+        pass
+    except Exception as e:
+        print(f"  ⚠️ catppt недоступен для {filename}: {e}")
+    finally:
+        if tmp_path:
+            try:
+                os.unlink(tmp_path)
+            except OSError:
+                pass
+
+    # python-pptx иногда открывает только pptx — пробуем на всякий случай
+    text = extract_text_from_pptx(file_bytes, filename)
+    if text.strip():
+        return text
+    print(f"  ⚠️ Старый .ppt может читаться неполно: {filename}")
+    return extract_text_from_txt(file_bytes, filename)
+
+
+def _dxf_collect_text(doc) -> List[str]:
+    parts: List[str] = []
+    try:
+        msp = doc.modelspace()
+    except Exception:
+        return parts
+
+    for entity in msp:
+        try:
+            dxftype = entity.dxftype()
+            if dxftype == "TEXT":
+                t = (entity.dxf.text or "").strip()
+                if t:
+                    parts.append(t)
+            elif dxftype == "MTEXT":
+                t = (entity.text or entity.plain_text() if hasattr(entity, "plain_text") else "").strip()
+                if not t and hasattr(entity, "plain_text"):
+                    t = entity.plain_text().strip()
+                if t:
+                    parts.append(t)
+            elif dxftype == "ATTRIB":
+                t = (entity.dxf.text or "").strip()
+                if t:
+                    parts.append(t)
+            elif dxftype == "ATTDEF":
+                t = (entity.dxf.text or "").strip()
+                if t:
+                    parts.append(t)
+            elif dxftype == "INSERT":
+                for attrib in getattr(entity, "attribs", []):
+                    t = (attrib.dxf.text or "").strip()
+                    if t:
+                        parts.append(t)
+        except Exception:
+            continue
+    return parts
+
+
+def extract_text_from_dwg(file_bytes: bytes, filename: str = "") -> str:
+    """Извлечение текста из DWG/DXF через ezdxf (DWG — best-effort)."""
+    if ezdxf is None:
+        print(f"  ❌ ezdxf не установлен — пропуск {filename}")
+        return ""
+
+    ext = file_ext(filename) or ".dxf"
+    tmp_path = None
+    try:
+        with tempfile.NamedTemporaryFile(suffix=ext if ext in {".dwg", ".dxf"} else ".dxf", delete=False) as tmp:
+            tmp.write(file_bytes)
+            tmp_path = tmp.name
+
+        doc = None
+        try:
+            doc = ezdxf.readfile(tmp_path)
+        except Exception:
+            if ezdxf_recover is not None:
+                try:
+                    doc, auditor = ezdxf_recover.readfile(tmp_path)
+                except Exception as e:
+                    print(f"  ❌ Не удалось открыть DWG/DXF {filename}: {e}")
+                    print("     (для нативных .dwg часто нужен ODA File Converter)")
+                    return ""
+            else:
+                return ""
+
+        parts = _dxf_collect_text(doc)
+        return "\n".join(parts)
+    except Exception as e:
+        print(f"  ❌ Ошибка DWG/DXF {filename}: {e}")
+        return ""
+    finally:
+        if tmp_path:
+            try:
+                os.unlink(tmp_path)
+            except OSError:
+                pass
+
+
+def extract_text_fallback(file_bytes: bytes, filename: str = "") -> str:
+    """Fallback: попытка прочитать неизвестный формат как текст."""
+    print(f"  ⚠️ Неизвестный формат {filename} — пробую как текст")
+    text = extract_text_from_txt(file_bytes, filename).strip()
+    # отсекаем явный бинарный мусор
+    if not text:
+        return ""
+    printable = sum(1 for ch in text if ch.isprintable() or ch in "\n\r\t")
+    if printable / max(len(text), 1) < 0.7:
+        print(f"  ⏭️ Похоже на бинарный файл, пропуск: {filename}")
+        return ""
+    return text
+
+
 def extract_text(file_bytes: bytes, filename: str) -> str:
     """Универсальное извлечение текста по расширению файла."""
-    ext = Path(filename).suffix.lower()
+    ext = file_ext(filename)
+
     if ext == ".pdf":
         return extract_text_from_pdf(file_bytes, filename)
     if ext == ".docx":
         return extract_text_from_docx(file_bytes, filename)
     if ext == ".doc":
         return extract_text_from_doc(file_bytes, filename)
-    if ext in {".xlsx", ".xls"}:
-        return extract_text_from_xlsx(file_bytes, filename)
-    if ext in {".txt", ".md", ".csv"}:
+    if ext == ".rtf":
+        return extract_text_from_rtf(file_bytes, filename)
+    if ext == ".odt":
+        return extract_text_from_odt(file_bytes, filename)
+    if ext in {".txt", ".log", ".md"}:
         return extract_text_from_txt(file_bytes, filename)
-    if ext in {".png", ".jpg", ".jpeg", ".tif", ".tiff", ".bmp", ".webp"}:
+    if ext in {".html", ".htm"}:
+        return extract_text_from_html(file_bytes, filename)
+    if ext == ".xml":
+        return extract_text_from_xml(file_bytes, filename)
+    if ext == ".json":
+        return extract_text_from_json(file_bytes, filename)
+    if ext == ".xlsx":
+        return extract_text_from_xlsx(file_bytes, filename)
+    if ext == ".xls":
+        return extract_text_from_xls(file_bytes, filename)
+    if ext == ".csv":
+        return extract_text_from_csv(file_bytes, filename)
+    if ext == ".ods":
+        return extract_text_from_ods(file_bytes, filename)
+    if ext in {".jpg", ".jpeg", ".png", ".bmp", ".gif", ".tif", ".tiff", ".webp"}:
         return extract_text_from_image(file_bytes, filename)
-    return ""
+    if ext in {".dwg", ".dxf"}:
+        return extract_text_from_dwg(file_bytes, filename)
+    if ext == ".pptx":
+        return extract_text_from_pptx(file_bytes, filename)
+    if ext == ".ppt":
+        return extract_text_from_ppt(file_bytes, filename)
+
+    # fallback для неизвестных форматов
+    return extract_text_fallback(file_bytes, filename)
 
 
 # =============================================================================
-# Распаковка архивов
+# Распаковка архивов (рекурсивно)
 # =============================================================================
 
 def _iter_archive_members_zip(file_bytes: bytes) -> List[Tuple[str, bytes]]:
@@ -292,7 +724,10 @@ def _iter_archive_members_zip(file_bytes: bytes) -> List[Tuple[str, bytes]]:
         for name in zf.namelist():
             if name.endswith("/") or "__MACOSX" in name or Path(name).name.startswith("."):
                 continue
-            members.append((name, zf.read(name)))
+            try:
+                members.append((name, zf.read(name)))
+            except Exception as e:
+                print(f"  ⚠️ Не удалось прочитать из ZIP: {name}: {e}")
     return members
 
 
@@ -307,7 +742,10 @@ def _iter_archive_members_rar(file_bytes: bytes) -> List[Tuple[str, bytes]]:
                 name = info.filename
                 if info.is_dir() or "__MACOSX" in name or Path(name).name.startswith("."):
                     continue
-                members.append((name, rf.read(info)))
+                try:
+                    members.append((name, rf.read(info)))
+                except Exception as e:
+                    print(f"  ⚠️ Не удалось прочитать из RAR: {name}: {e}")
     finally:
         try:
             os.unlink(tmp_path)
@@ -341,9 +779,40 @@ def _iter_archive_members_7z(file_bytes: bytes) -> List[Tuple[str, bytes]]:
     return members
 
 
+def _iter_archive_members_tar(file_bytes: bytes) -> List[Tuple[str, bytes]]:
+    members: List[Tuple[str, bytes]] = []
+    with tarfile.open(fileobj=io.BytesIO(file_bytes), mode="r:*") as tf:
+        for info in tf.getmembers():
+            if not info.isfile():
+                continue
+            name = info.name
+            if "__MACOSX" in name or Path(name).name.startswith("."):
+                continue
+            f = tf.extractfile(info)
+            if f is None:
+                continue
+            members.append((name, f.read()))
+    return members
+
+
+def _iter_gzip_member(file_bytes: bytes, filename: str) -> List[Tuple[str, bytes]]:
+    """Одиночный .gz (не tar.gz): распаковать и вернуть внутренний файл."""
+    try:
+        data = gzip.decompress(file_bytes)
+    except Exception as e:
+        print(f"  ❌ Ошибка gzip {filename}: {e}")
+        return []
+    inner_name = Path(filename).name
+    if inner_name.lower().endswith(".gz"):
+        inner_name = inner_name[:-3]
+    if not inner_name:
+        inner_name = "uncompressed.bin"
+    return [(inner_name, data)]
+
+
 def unpack_archive(file_bytes: bytes, filename: str) -> List[Tuple[str, bytes]]:
-    """Распаковывает ZIP / RAR / 7Z и возвращает список (имя, байты)."""
-    ext = Path(filename).suffix.lower()
+    """Распаковывает ZIP / RAR / 7Z / TAR / GZ и возвращает список (имя, байты)."""
+    ext = file_ext(filename)
     try:
         if ext == ".zip":
             return _iter_archive_members_zip(file_bytes)
@@ -351,6 +820,11 @@ def unpack_archive(file_bytes: bytes, filename: str) -> List[Tuple[str, bytes]]:
             return _iter_archive_members_rar(file_bytes)
         if ext == ".7z":
             return _iter_archive_members_7z(file_bytes)
+        if ext in {".tar", ".tar.gz", ".tgz"}:
+            return _iter_archive_members_tar(file_bytes)
+        if ext == ".gz":
+            # .tar.gz уже обработан выше; чистое .gz
+            return _iter_gzip_member(file_bytes, filename)
     except Exception as e:
         print(f"  ❌ Ошибка распаковки {filename}: {e}")
     return []
@@ -358,39 +832,27 @@ def unpack_archive(file_bytes: bytes, filename: str) -> List[Tuple[str, bytes]]:
 
 def extract_documents_from_bytes(file_bytes: bytes, filename: str) -> List[Tuple[str, str]]:
     """
-    Извлекает документы из файла или архива.
+    Извлекает документы из файла или архива (рекурсивно).
     Возвращает список (источник, текст).
     """
-    ext = Path(filename).suffix.lower()
+    ext = file_ext(filename)
     results: List[Tuple[str, str]] = []
 
     if ext in SUPPORTED_ARCHIVES:
         for inner_name, data in unpack_archive(file_bytes, filename):
-            inner_ext = Path(inner_name).suffix.lower()
-            if inner_ext in SUPPORTED_ARCHIVES:
-                # вложенный архив
-                nested = extract_documents_from_bytes(data, f"{filename}/{inner_name}")
-                results.extend(nested)
-                continue
-            if inner_ext not in SUPPORTED_DOCS:
-                print(f"  ⏭️ Пропуск: {filename}/{inner_name}")
-                continue
-            text = extract_text(data, inner_name)
-            if text.strip():
-                results.append((f"{filename}/{inner_name}", text))
-            else:
-                print(f"  ⚠️ Пустой текст: {filename}/{inner_name}")
+            nested = extract_documents_from_bytes(data, f"{filename}/{inner_name}")
+            results.extend(nested)
         return results
 
-    if ext not in SUPPORTED_DOCS:
-        print(f"⏭️ Неподдерживаемый формат: {filename}")
-        return []
-
+    # известный документ / неизвестный → extract_text (с fallback)
     text = extract_text(file_bytes, filename)
     if text.strip():
         results.append((filename, text))
     else:
-        print(f"  ⚠️ Не удалось извлечь текст из {filename}")
+        if ext and ext not in SUPPORTED_DOCS:
+            print(f"  ⚠️ Не удалось извлечь текст из {filename}")
+        else:
+            print(f"  ⚠️ Пустой текст: {filename}")
     return results
 
 
@@ -435,10 +897,7 @@ class RAGIndex:
         self.matrix = None
 
     def build(self, documents: List[Tuple[str, str]]) -> int:
-        """
-        Строит индекс по списку (source, text).
-        Возвращает число чанков.
-        """
+        """Строит индекс по списку (source, text). Возвращает число чанков."""
         self.chunks = []
         self.sources = []
 
@@ -459,7 +918,10 @@ class RAGIndex:
             sublinear_tf=True,
         )
         self.matrix = self.vectorizer.fit_transform(self.chunks)
-        print(f"✅ Индекс построен: {len(self.chunks)} чанков из {len({s for s in self.sources})} источников.")
+        print(
+            f"✅ Индекс построен: {len(self.chunks)} чанков "
+            f"из {len({s for s in self.sources})} источников."
+        )
         return len(self.chunks)
 
     def search(self, query: str, top_k: int = TOP_K) -> List[Dict[str, Any]]:
@@ -569,7 +1031,10 @@ def ask_with_rag(question: str, top_k: int = TOP_K) -> Dict[str, Any]:
     hits = rag_index.search(question, top_k=top_k)
     if not hits:
         return {
-            "answer": "❌ Индекс пуст или ничего не найдено. Сначала выполните модуль 2 (Загрузка данных).",
+            "answer": (
+                "❌ Индекс пуст или ничего не найдено. "
+                "Сначала выполните модуль 2–3 (Загрузка и индексация)."
+            ),
             "sources": [],
         }
     context = "\n\n---\n\n".join(
@@ -580,6 +1045,14 @@ def ask_with_rag(question: str, top_k: int = TOP_K) -> Dict[str, Any]:
 
 
 # --- Готово ---
+print(
+    "📎 Поддерживаемые форматы: "
+    "docx/doc/rtf/odt/pdf/txt/log/md/html/xml/json, "
+    "xlsx/xls/csv/ods, "
+    "jpg/png/bmp/gif/tif/webp (OCR), "
+    "zip/rar/7z/tar/gz, "
+    "dwg/dxf, ppt/pptx + fallback как текст."
+)
 if DEEPSEEK_API_KEY:
     print("🔐 API-ключ DeepSeek сохранён в сессии.")
 else:
