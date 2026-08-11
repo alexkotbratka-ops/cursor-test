@@ -17,7 +17,7 @@ def _run(cmd, check=False):
     )
 
 
-print("📦 Установка системных пакетов (tesseract, poppler, unrar, p7zip)...")
+print("📦 Установка системных пакетов (tesseract, poppler, unrar, p7zip, antiword)...")
 _run(["apt-get", "update", "-qq"])
 _run(
     [
@@ -31,8 +31,10 @@ _run(
         "poppler-utils",
         "unrar",
         "p7zip-full",
+        "antiword",
     ]
 )
+_run(["apt-get", "install", "-y", "-qq", "antiword"])
 
 print("📦 Установка Python-библиотек...")
 subprocess.check_call(
@@ -94,7 +96,23 @@ CHUNK_OVERLAP = 150
 TOP_K = 5
 OCR_LANG = "rus+eng"
 
-SUPPORTED_DOCS = {".pdf", ".docx", ".xlsx", ".xls", ".txt", ".md", ".csv", ".png", ".jpg", ".jpeg", ".tif", ".tiff", ".bmp", ".webp"}
+SUPPORTED_DOCS = {
+    ".pdf",
+    ".docx",
+    ".doc",
+    ".xlsx",
+    ".xls",
+    ".txt",
+    ".md",
+    ".csv",
+    ".png",
+    ".jpg",
+    ".jpeg",
+    ".tif",
+    ".tiff",
+    ".bmp",
+    ".webp",
+}
 SUPPORTED_ARCHIVES = {".zip", ".rar", ".7z"}
 SUPPORTED_EXTENSIONS = SUPPORTED_DOCS | SUPPORTED_ARCHIVES
 
@@ -146,6 +164,55 @@ def extract_text_from_docx(file_bytes: bytes, filename: str = "") -> str:
     except Exception as e:
         print(f"  ❌ Ошибка DOCX {filename}: {e}")
     return "\n".join(parts)
+
+
+def extract_text_from_doc(file_bytes: bytes, filename: str = "") -> str:
+    """Извлекает текст из старых .doc (Word 97–2003) через antiword."""
+    tmp_path = None
+    try:
+        with tempfile.NamedTemporaryFile(suffix=".doc", delete=False) as tmp:
+            tmp.write(file_bytes)
+            tmp_path = tmp.name
+
+        result = subprocess.run(
+            ["antiword", "-m", "UTF-8.txt", tmp_path],
+            capture_output=True,
+            check=False,
+        )
+        # antiword может отдать текст в stdout даже при ненулевом коде
+        raw = result.stdout or b""
+        if not raw and result.stderr:
+            # повтор без карты UTF-8 (на части систем её нет)
+            result = subprocess.run(
+                ["antiword", tmp_path],
+                capture_output=True,
+                check=False,
+            )
+            raw = result.stdout or b""
+
+        if not raw:
+            err = (result.stderr or b"").decode("utf-8", errors="replace").strip()
+            print(f"  ❌ antiword не извлёк текст из {filename}" + (f": {err}" if err else ""))
+            return ""
+
+        for encoding in ("utf-8", "cp1251", "latin-1"):
+            try:
+                return raw.decode(encoding).strip()
+            except UnicodeDecodeError:
+                continue
+        return raw.decode("latin-1", errors="replace").strip()
+    except FileNotFoundError:
+        print(f"  ❌ antiword не установлен — не удалось прочитать {filename}")
+        return ""
+    except Exception as e:
+        print(f"  ❌ Ошибка DOC {filename}: {e}")
+        return ""
+    finally:
+        if tmp_path:
+            try:
+                os.unlink(tmp_path)
+            except OSError:
+                pass
 
 
 def extract_text_from_xlsx(file_bytes: bytes, filename: str = "") -> str:
@@ -204,6 +271,8 @@ def extract_text(file_bytes: bytes, filename: str) -> str:
         return extract_text_from_pdf(file_bytes, filename)
     if ext == ".docx":
         return extract_text_from_docx(file_bytes, filename)
+    if ext == ".doc":
+        return extract_text_from_doc(file_bytes, filename)
     if ext in {".xlsx", ".xls"}:
         return extract_text_from_xlsx(file_bytes, filename)
     if ext in {".txt", ".md", ".csv"}:
