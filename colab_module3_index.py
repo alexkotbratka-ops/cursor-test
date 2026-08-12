@@ -44,44 +44,8 @@ CHUNK_OVERLAP = 100
 TOP_K = 6                            # 5–8 для поиска в сессии
 
 
-def page_needs_ocr(page, digital_text: str) -> bool:
-    """
-    OCR при смешанном контенте: мало текста ИЛИ есть изображения/графика.
-    """
-    text = (digital_text or "").strip()
-    chars = len(re.sub(r"\s+", "", text))
-    if chars < OCR_MIN_CHARS_PER_PAGE:
-        return True
-    try:
-        if page.get_images(full=True):
-            return True
-    except Exception:
-        pass
-    try:
-        if page.get_image_info(xrefs=True):
-            return True
-    except Exception:
-        pass
-    try:
-        if len(page.get_drawings() or []) >= 5:
-            return True
-    except Exception:
-        pass
-    try:
-        rect = page.rect
-        page_area = abs(rect.width * rect.height) or 1.0
-        img_area = 0.0
-        for info in page.get_image_info(xrefs=True) or []:
-            bbox = info.get("bbox")
-            if not bbox:
-                continue
-            x0, y0, x1, y1 = bbox
-            img_area += abs((x1 - x0) * (y1 - y0))
-        if (img_area / page_area) >= OCR_IMAGE_AREA_RATIO:
-            return True
-    except Exception:
-        pass
-    return False
+
+# ВАЖНО: page_needs_ocr() НЕ переопределяем — используем глобальную из модуля 1.
 
 
 # Пересоздаём индекс с новым размером чанка
