@@ -1818,7 +1818,7 @@ tender_answers = answers
 tender_file_status = file_status_rows
 
 _manual_link = _manual_download_link(report_filename)
-_elapsed_total = time.time() - _T0_ANALYSIS
+_elapsed_total = time.time() - _T0_ALL
 
 _status("скачивание отчёта")
 if colab_files is not None:
@@ -1839,7 +1839,7 @@ print(f"   🔗 {_manual_link}")
 
 print()
 print("=" * 70)
-print("⏱ ВРЕМЯ ВЫПОЛНЕНИЯ")
+print("⏱ ВРЕМЯ ВЫПОЛНЕНИЯ (весь модуль 6)")
 print("=" * 70)
 print(f"   Итого прошло: {_fmt_elapsed(_elapsed_total)}")
 print(f"   Финальный статус: отчёт готов")
