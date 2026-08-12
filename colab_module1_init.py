@@ -370,55 +370,93 @@ def ocr_pdf_page(page, page_no: int, filename: str = "", page_count: int = 0) ->
         return ""
 
 
-# Кэш: один и тот же PDF (по MD5) не OCR-ится повторно при дублях в архиве
+# Кэш результата PDF + защита от параллельного повторного OCR
 _PDF_TEXT_CACHE: Dict[str, str] = {}
+_PDF_OCR_INFLIGHT: Dict[str, Any] = {}
 try:
     import threading as _threading_pdf
     _PDF_TEXT_LOCK = _threading_pdf.Lock()
 except Exception:
+    _threading_pdf = None  # type: ignore
     _PDF_TEXT_LOCK = None
+
+
+def _pdf_cache_get(cache_key: str) -> Optional[str]:
+    if _PDF_TEXT_LOCK is None:
+        return _PDF_TEXT_CACHE.get(cache_key)
+    with _PDF_TEXT_LOCK:
+        return _PDF_TEXT_CACHE.get(cache_key)
+
+
+def _pdf_cache_put(cache_key: str, value: str) -> str:
+    if _PDF_TEXT_LOCK is None:
+        _PDF_TEXT_CACHE[cache_key] = value
+        return value
+    with _PDF_TEXT_LOCK:
+        _PDF_TEXT_CACHE[cache_key] = value
+        ev = _PDF_OCR_INFLIGHT.pop(cache_key, None)
+        if ev is not None:
+            try:
+                ev.set()
+            except Exception:
+                pass
+    return value
+
+
+def _pdf_begin_work(cache_key: str):
+    """
+    Возвращает (cached_text | None, wait_event | None, is_owner).
+    is_owner=True — этот поток должен выполнить OCR.
+    """
+    if _PDF_TEXT_LOCK is None or _threading_pdf is None:
+        cached = _PDF_TEXT_CACHE.get(cache_key)
+        return cached, None, cached is None
+    with _PDF_TEXT_LOCK:
+        cached = _PDF_TEXT_CACHE.get(cache_key)
+        if cached is not None:
+            return cached, None, False
+        if cache_key in _PDF_OCR_INFLIGHT:
+            return None, _PDF_OCR_INFLIGHT[cache_key], False
+        ev = _threading_pdf.Event()
+        _PDF_OCR_INFLIGHT[cache_key] = ev
+        return None, None, True
 
 
 def extract_text_from_pdf(file_bytes: bytes, filename: str = "") -> str:
     """
-    PDF: ровно ОДИН проход OCR на документ.
+    PDF: ровно ОДИН проход OCR на документ (флаг ocr_done).
 
     Алгоритм:
       1) Быстрый обзор — только цифровой текст (OCR ещё нет).
-      2) Если PDF — скан (почти нет цифрового текста) →
-         сразу один полный OCR (ocr_pdf_bytes), без предварительного
-         постраничного OCR.
-      3) Если смешанный контент → цифровой текст + OCR только страниц
-         с изображениями/бедным текстом (один раз).
-      4) Повторный «полный OCR» в конце НЕ запускается.
+      2) Если PDF — скан → один полный OCR, ocr_done=True, выход.
+      3) Если смешанный → OCR только нужных страниц, ocr_done=True.
+      4) После ocr_done=True полный OCR больше НЕ вызывается
+         (нет повторной проверки в конце; полный OCR вне except-retry).
     """
     import hashlib as _hashlib
 
     cache_key = _hashlib.md5(file_bytes).hexdigest()
-    if _PDF_TEXT_LOCK is not None:
-        _PDF_TEXT_LOCK.acquire()
-    try:
-        cached = _PDF_TEXT_CACHE.get(cache_key)
-    finally:
-        if _PDF_TEXT_LOCK is not None:
-            _PDF_TEXT_LOCK.release()
+    cached, wait_ev, is_owner = _pdf_begin_work(cache_key)
     if cached is not None:
         print(f"  ⏭️ PDF уже извлечён (кэш, без повторного OCR): {filename}", flush=True)
         return cached
-
-    def _store(result: str) -> str:
-        if _PDF_TEXT_LOCK is not None:
-            _PDF_TEXT_LOCK.acquire()
+    if not is_owner and wait_ev is not None:
+        print(f"  ⏳ PDF уже OCR-ится другим потоком, ждём: {filename}", flush=True)
         try:
-            _PDF_TEXT_CACHE[cache_key] = result
-        finally:
-            if _PDF_TEXT_LOCK is not None:
-                _PDF_TEXT_LOCK.release()
-        return result
+            wait_ev.wait(timeout=3600)
+        except Exception:
+            pass
+        cached2 = _pdf_cache_get(cache_key)
+        return cached2 if cached2 is not None else ""
 
-    parts: List[str] = []
+    ocr_done = False
+    need_full_ocr = False
+    result = ""
     page_count = 0
+    parts: List[str] = []
+    ocr_pages = 0
 
+    # --- Анализ PDF (без полного OCR внутри try, чтобы except не делал retry) ---
     try:
         doc = fitz.open(stream=file_bytes, filetype="pdf")
         page_count = int(doc.page_count or 0)
@@ -427,7 +465,6 @@ def extract_text_from_pdf(file_bytes: bytes, filename: str = "") -> str:
             flush=True,
         )
 
-        # --- Проход 1: только цифровой текст + решение, нужен ли OCR ---
         digital_list: List[str] = []
         need_ocr_flags: List[bool] = []
         digital_chars_total = 0
@@ -443,60 +480,76 @@ def extract_text_from_pdf(file_bytes: bytes, filename: str = "") -> str:
 
         avg = (digital_chars_total / page_count) if page_count else 0.0
         force_below = float(globals().get("OCR_PDF_FORCE_FULL_IF_AVG_BELOW", 15) or 15)
-        # Скан: нет (почти) цифрового текста → полный OCR сразу, один раз
         is_full_scan = bool(page_count) and avg < force_below and pages_with_digital == 0
 
         if is_full_scan:
             doc.close()
             print(
                 f"  🔍 PDF похож на скан (avg={avg:.0f} симв/стр) — "
-                f"один полный OCR (без предварительного): {filename}",
+                f"нужен один полный OCR: {filename}",
                 flush=True,
             )
-            return _store(ocr_pdf_bytes(file_bytes, filename))
-
-        # --- Проход 2 (смешанный/цифровой): OCR только нужных страниц ---
-        pages_to_ocr = sum(1 for flag in need_ocr_flags if flag)
-        if pages_to_ocr:
-            print(
-                f"  🔍 PDF смешанный: OCR {pages_to_ocr} из {page_count} стр. — {filename}",
-                flush=True,
-            )
+            need_full_ocr = True
         else:
-            print(f"  ✅ PDF {filename}: OCR не нужен (есть цифровой текст, нет сканов)", flush=True)
-
-        ocr_pages = 0
-        for i, page in enumerate(doc, start=1):
-            digital = digital_list[i - 1]
-            page_bits: List[str] = []
-            if digital:
-                page_bits.append(digital)
-
-            if need_ocr_flags[i - 1]:
-                ocr_text = ocr_pdf_page(page, i, filename, page_count=page_count)
-                if ocr_text:
-                    extra = ocr_supplement_text(digital, ocr_text)
-                    if extra:
-                        ocr_pages += 1
-                        label = "[OCR-дополнение]" if digital else "[OCR]"
-                        page_bits.append(f"{label}\n{extra}")
-
-            if page_bits:
-                parts.append(f"[Страница {i}]\n" + "\n".join(page_bits))
+            pages_to_ocr = sum(1 for flag in need_ocr_flags if flag)
+            if pages_to_ocr:
+                print(
+                    f"  🔍 PDF смешанный: OCR {pages_to_ocr} из {page_count} стр. — {filename}",
+                    flush=True,
+                )
             else:
-                print(f"  ⚠️ Страница {i} без текста даже после OCR: {filename}")
+                print(
+                    f"  ✅ PDF {filename}: OCR не нужен (есть цифровой текст, нет сканов)",
+                    flush=True,
+                )
 
-        doc.close()
+            for i, page in enumerate(doc, start=1):
+                digital = digital_list[i - 1]
+                page_bits: List[str] = []
+                if digital:
+                    page_bits.append(digital)
+
+                if need_ocr_flags[i - 1]:
+                    ocr_text = ocr_pdf_page(page, i, filename, page_count=page_count)
+                    if ocr_text:
+                        extra = ocr_supplement_text(digital, ocr_text)
+                        if extra:
+                            ocr_pages += 1
+                            label = "[OCR-дополнение]" if digital else "[OCR]"
+                            page_bits.append(f"{label}\n{extra}")
+
+                if page_bits:
+                    parts.append(f"[Страница {i}]\n" + "\n".join(page_bits))
+                else:
+                    print(f"  ⚠️ Страница {i} без текста даже после OCR: {filename}")
+
+            doc.close()
+            if pages_to_ocr > 0:
+                ocr_done = True  # постраничный OCR уже был — полный запрещён
+            result = "\n\n".join(parts)
+            if ocr_pages:
+                print(
+                    f"  ✅ PDF {filename}: OCR выполнен один раз на {ocr_pages}/{page_count} стр.",
+                    flush=True,
+                )
     except Exception as e:
         print(f"  ❌ Ошибка PDF {filename}: {e}")
-        # Единственный аварийный путь — один полный OCR
-        return _store(ocr_pdf_bytes(file_bytes, filename))
+        # Только если OCR ещё не делали — пометим необходимость полного OCR
+        if not ocr_done:
+            need_full_ocr = True
 
-    result = "\n\n".join(parts)
-    if ocr_pages:
-        print(f"  ✅ PDF {filename}: OCR выполнен один раз на {ocr_pages}/{page_count} стр.")
-    # Важно: повторный полный OCR здесь НЕ вызываем
-    return _store(result)
+    # --- Полный OCR максимум один раз, ВНЕ except-retry ---
+    if need_full_ocr and not ocr_done:
+        print(f"  🔍 Полный OCR запускается один раз: {filename}", flush=True)
+        result = ocr_pdf_bytes(file_bytes, filename)
+        ocr_done = True
+    elif need_full_ocr and ocr_done:
+        print(
+            f"  ⏭️ OCR уже выполнен (ocr_done=True) — повторный полный OCR пропущен: {filename}",
+            flush=True,
+        )
+
+    return _pdf_cache_put(cache_key, result)
 
 
 def extract_text_from_docx(file_bytes: bytes, filename: str = "") -> str:
