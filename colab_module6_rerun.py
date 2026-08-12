@@ -211,8 +211,8 @@ except Exception:
 # =============================================================================
 
 DOCX_OCR_MIN_TEXT_CHARS = 200   # OCR картинок в DOCX только если текста мало
-ARCHIVE_MAX_DEPTH = 2           # глубина вложенных архивов
-FILE_PROCESS_TIMEOUT = 120      # сек. на один загруженный файл
+ARCHIVE_MAX_DEPTH = 4           # глубина вложенных архивов (было 2)
+FILE_PROCESS_TIMEOUT = 180      # сек. на один загруженный файл (архивы могут быть тяжёлыми)
 # OCR_DPI не трогаем — берём из сессии / ниже
 
 OCR_DPI = int(globals().get("OCR_DPI", 200) or 200)
@@ -232,6 +232,121 @@ _CURRENT_FILE = {"name": "—"}
 def _log(*args, **kwargs):
     with _PRINT_LOCK:
         print(*args, **kwargs)
+
+
+def _basename(filename: str) -> str:
+    return str(filename).replace("\\", "/").split("/")[-1]
+
+
+def _fmt_size(n: int) -> str:
+    if n >= 1024 * 1024:
+        return f"{n / (1024 * 1024):.2f} MB ({n:,} байт)"
+    if n >= 1024:
+        return f"{n / 1024:.2f} KB ({n:,} байт)"
+    return f"{n} байт"
+
+
+def _safe_ext_early(filename: str) -> str:
+    if "file_ext" in globals():
+        ext = file_ext(str(filename).replace("\\", "/"))
+        if ext:
+            return ext
+    name = str(filename).replace("\\", "/").split("/")[-1].lower().strip()
+    if name.endswith(".tar.gz"):
+        return ".tar.gz"
+    if "." not in name:
+        return ""
+    return "." + name.rsplit(".", 1)[-1]
+
+
+# Оригинал unpack_archive из модуля 1/5 — сохранить ДО переопределения
+_ORIG_UNPACK_ARCHIVE = globals().get("unpack_archive")
+
+
+def _iter_archive_members_zip_safe(file_bytes: bytes) -> List[Tuple[str, bytes]]:
+    """ZIP с починкой кириллических имён + лог каждой записи."""
+    import zipfile as _zipfile
+
+    members: List[Tuple[str, bytes]] = []
+    try:
+        zf = _zipfile.ZipFile(io.BytesIO(file_bytes))
+    except Exception as e:
+        _log(f"  ❌ ZIP не открылся: {e}")
+        return members
+
+    def _fix_name(name: str, info) -> str:
+        name = name.replace("\\", "/")
+        if info.flag_bits & 0x800:
+            return name
+        try:
+            raw = name.encode("cp437", errors="strict")
+        except Exception:
+            return name
+        best = name
+        for enc in ("cp866", "cp1251", "utf-8"):
+            try:
+                decoded = raw.decode(enc)
+                best = decoded
+                if any("а" <= ch.lower() <= "я" or ch in "ёЁ" for ch in decoded):
+                    return decoded
+            except Exception:
+                continue
+        return best
+
+    with zf:
+        infos = zf.infolist()
+        _log(f"  📦 ZIP-записей (включая папки): {len(infos)}")
+        for info in infos:
+            name = _fix_name(info.filename, info)
+            if name.endswith("/") or info.is_dir():
+                _log(f"     · (папка) {name}")
+                continue
+            base = name.rsplit("/", 1)[-1]
+            if "__MACOSX" in name or base.startswith("."):
+                continue
+            try:
+                data = zf.read(info)
+                members.append((name, data))
+                _log(f"     · файл {name} [{len(data):,} байт]")
+            except Exception as e:
+                _log(f"  ⚠️ ZIP read fail {name}: {e}")
+    return members
+
+
+def unpack_archive(file_bytes: bytes, filename: str) -> List[Tuple[str, bytes]]:
+    """Распаковка с подробным логом; ZIP — с кириллицей."""
+    ext = _safe_ext_early(filename)
+    _log(f"  📂 Распаковка «{_basename(filename)}» ({ext or '?'}, {len(file_bytes):,} байт)...")
+    members: List[Tuple[str, bytes]] = []
+    try:
+        if ext == ".zip":
+            members = _iter_archive_members_zip_safe(file_bytes)
+        elif callable(_ORIG_UNPACK_ARCHIVE):
+            members = _ORIG_UNPACK_ARCHIVE(file_bytes, filename) or []
+        elif ext == ".rar" and "_iter_archive_members_rar" in globals():
+            members = _iter_archive_members_rar(file_bytes)
+        elif ext == ".7z" and "_iter_archive_members_7z" in globals():
+            members = _iter_archive_members_7z(file_bytes)
+        elif ext in {".tar", ".tar.gz", ".tgz"} and "_iter_archive_members_tar" in globals():
+            members = _iter_archive_members_tar(file_bytes)
+        elif ext == ".gz" and "_iter_gzip_member" in globals():
+            members = _iter_gzip_member(file_bytes, filename)
+        else:
+            members = _iter_archive_members_zip_safe(file_bytes)
+    except Exception as e:
+        _log(f"  ❌ Ошибка распаковки {filename}: {e}")
+        members = []
+
+    if not members:
+        _log(f"  ⚠️ Архив «{_basename(filename)}»: файлов не извлечено (пусто / ошибка / только папки)")
+    else:
+        _log(f"  ✅ Архив «{_basename(filename)}»: итого файлов = {len(members)}")
+        for name, data in members[:80]:
+            nest = "📦" if _safe_ext_early(name) in (SUPPORTED_ARCHIVES if "SUPPORTED_ARCHIVES" in globals() else set()) else "📄"
+            _log(f"     {nest} {name} [{_fmt_size(len(data))}]")
+        if len(members) > 80:
+            _log(f"     … и ещё {len(members) - 80}")
+    return members
 
 
 def extract_text_from_docx(file_bytes: bytes, filename: str = "") -> str:
@@ -378,32 +493,8 @@ def _progress_line(done: int, total: int, t0: float, label: str = "", current: s
     )
 
 
-def _fmt_size(n: int) -> str:
-    if n >= 1024 * 1024:
-        return f"{n / (1024 * 1024):.2f} MB ({n:,} байт)"
-    if n >= 1024:
-        return f"{n / 1024:.2f} KB ({n:,} байт)"
-    return f"{n} байт"
-
-
 def _safe_ext(filename: str) -> str:
-    if "file_ext" in globals():
-        normalized = str(filename).replace("\\", "/")
-        ext = file_ext(normalized)
-        if ext:
-            return ext
-    name = str(filename).replace("\\", "/").split("/")[-1].lower().strip()
-    if name.endswith(".tar.gz"):
-        return ".tar.gz"
-    if name.endswith(".tar.bz2"):
-        return ".tar.bz2"
-    if "." not in name:
-        return ""
-    return "." + name.rsplit(".", 1)[-1]
-
-
-def _basename(filename: str) -> str:
-    return str(filename).replace("\\", "/").split("/")[-1]
+    return _safe_ext_early(filename)
 
 
 def _canon_basename(filename: str) -> str:
@@ -522,6 +613,7 @@ def _extract_from_any(file_bytes: bytes, filename: str, depth: int = 0) -> List[
         if depth >= ARCHIVE_MAX_DEPTH:
             _log(f"  ⏭️ Архив глубже {ARCHIVE_MAX_DEPTH} ур. — пропуск: {filename}")
             return results
+        _log(f"  📦 Вложенный архив (depth={depth}): {_basename(filename)}")
         try:
             members = unpack_archive(file_bytes, filename)
         except Exception as e:
@@ -533,79 +625,87 @@ def _extract_from_any(file_bytes: bytes, filename: str, depth: int = 0) -> List[
             if _register_or_skip_inner(inner_norm, data):
                 _log(f"  ⏭️ Пропуск дубликата: {inner_norm} (уже обработан)")
                 continue
+            inner_ext = _safe_ext(inner_norm)
+            if inner_ext in SUPPORTED_ARCHIVES:
+                _log(f"     ↳ ещё один уровень архива: {inner_norm}")
             results.extend(_extract_from_any(data, full, depth=depth + 1))
         return results
 
     text = _read_document_bytes(file_bytes, filename)
     if text:
         results.append((filename, text))
+        _log(f"     ✅ {_basename(filename)}: {len(text):,} симв.")
+    else:
+        _log(f"     ⚠️ {_basename(filename)}: текст не извлечён")
     return results
 
 
 def _process_uploaded_file(filename: str, file_bytes: bytes) -> List[Tuple[str, str]]:
-    """Читает один загруженный файл/архив. Потокобезопасно по логам."""
+    """Читает один загруженный файл/архив. Логирует содержимое архива сразу."""
     _CURRENT_FILE["name"] = _basename(filename)
     ext = _safe_ext(filename)
     size = len(file_bytes)
     extracted: List[Tuple[str, str]] = []
     t0 = time.time()
 
-    lines = [
-        "=" * 80,
-        f"📄 Файл: {filename}",
-        f"   Размер: {_fmt_size(size)}",
-        f"   Тип: {'архив ' + ext if ext in SUPPORTED_ARCHIVES else ext or '(без расширения)'}",
-    ]
+    _log("=" * 80)
+    _log(f"📄 Файл: {filename}")
+    _log(f"   Размер: {_fmt_size(size)}")
+    _log(f"   Тип: {'архив ' + ext if ext in SUPPORTED_ARCHIVES else ext or '(без расширения)'}")
 
     if ext in SUPPORTED_ARCHIVES:
-        lines.append("   Содержимое архива (глубина ≤ {0}):".format(ARCHIVE_MAX_DEPTH))
+        _log(f"   Распаковка архива (макс. глубина вложенности = {ARCHIVE_MAX_DEPTH})...")
         try:
             members = unpack_archive(file_bytes, filename)
         except Exception as e:
-            lines.append(f"   ❌ Не удалось открыть архив: {e}")
+            _log(f"   ❌ Не удалось открыть архив: {e}")
             members = []
 
         if not members:
-            lines.append("   ⚠️ Архив пуст или не удалось прочитать.")
-        else:
-            for inner_name, data in members:
-                if time.time() - t0 > FILE_PROCESS_TIMEOUT:
-                    lines.append(f"   ⏱️ Таймаут {FILE_PROCESS_TIMEOUT}с — остаток архива пропущен")
-                    break
-                inner_norm = str(inner_name).replace("\\", "/")
-                inner_ext = _safe_ext(inner_norm)
-                prefix = f"   • {inner_norm} [{_fmt_size(len(data))}]"
-                source = f"{filename}/{inner_norm}"
+            _log("   ⚠️ Архив пуст или не удалось прочитать содержимое.")
+            _log(f"   Время файла: {time.time() - t0:.1f}с")
+            return []
 
-                if _register_or_skip_inner(inner_norm, data):
-                    lines.append(f"{prefix} → ⏭️ Пропуск дубликата: {inner_norm} (уже обработан)")
-                    continue
+        _log(f"   Обработка содержимого: {len(members)} файл(ов)...")
+        for i, (inner_name, data) in enumerate(members, start=1):
+            if time.time() - t0 > FILE_PROCESS_TIMEOUT:
+                _log(f"   ⏱️ Таймаут {FILE_PROCESS_TIMEOUT}с — остаток архива пропущен")
+                break
+            inner_norm = str(inner_name).replace("\\", "/")
+            inner_ext = _safe_ext(inner_norm)
+            source = f"{filename}/{inner_norm}"
+            _log(f"   → [{i}/{len(members)}] {inner_norm} [{_fmt_size(len(data))}]")
 
-                if inner_ext in SUPPORTED_ARCHIVES:
-                    # depth=1: мы уже на 1-м уровне внутри upload-архива
-                    nested = _extract_from_any(data, source, depth=1)
-                    extracted.extend(nested)
-                    if nested:
-                        chars = sum(len(t) for _, t in nested)
-                        lines.append(
-                            f"{prefix} → вложенный архив, извлечено {len(nested)} док., {chars:,} символов"
-                        )
-                    else:
-                        lines.append(f"{prefix} → вложенный архив, пусто / только дубли / лимит глубины")
-                    continue
+            if _register_or_skip_inner(inner_norm, data):
+                _log("      ⏭️ дубликат — пропуск")
+                continue
 
-                text = _read_document_bytes(data, inner_norm)
-                if text:
-                    extracted.append((source, text))
-                    lines.append(f"{prefix} → {_status_label(inner_ext, True)} ({len(text):,} символов)")
+            if inner_ext in SUPPORTED_ARCHIVES:
+                _log(f"      📦 вложенный архив — распаковка (depth=1)...")
+                nested = _extract_from_any(data, source, depth=1)
+                extracted.extend(nested)
+                if nested:
+                    chars = sum(len(t) for _, t in nested)
+                    _log(f"      ✅ извлечено {len(nested)} док., {chars:,} символов")
+                    for src, txt in nested[:10]:
+                        _log(f"         • {src} ({len(txt):,} симв.)")
+                    if len(nested) > 10:
+                        _log(f"         … и ещё {len(nested) - 10}")
                 else:
-                    lines.append(f"{prefix} → {_status_label(inner_ext, False)}")
+                    _log("      ⚠️ вложенный архив: пусто / дубли / лимит глубины")
+                continue
+
+            text = _read_document_bytes(data, inner_norm)
+            if text:
+                extracted.append((source, text))
+                _log(f"      ✅ {_status_label(inner_ext, True)} ({len(text):,} символов)")
+            else:
+                _log(f"      ⚠️ {_status_label(inner_ext, False)}")
 
         docs_count = len(extracted)
         chars_total = sum(len(t) for _, t in extracted)
-        lines.append(f"   Итого по архиву: документов={docs_count}, символов={chars_total:,}")
-        lines.append(f"   Время файла: {time.time() - t0:.1f}с")
-        _log("\n".join(lines))
+        _log(f"   Итого по архиву: документов={docs_count}, символов={chars_total:,}")
+        _log(f"   Время файла: {time.time() - t0:.1f}с")
         return extracted
 
     # Файл верхнего уровня — уже уникален после dedupe_uploaded
@@ -615,16 +715,16 @@ def _process_uploaded_file(filename: str, file_bytes: bytes) -> List[Tuple[str, 
     else:
         try:
             extracted = extract_documents_from_bytes(file_bytes, filename, depth=0) or []
-        except Exception:
+        except Exception as e:
+            _log(f"   ⚠️ extract_documents_from_bytes: {e}")
             extracted = []
 
     docs_count = len(extracted)
     chars_total = sum(len(t) for _, t in extracted)
-    lines.append(f"   Статус: {_status_label(ext, docs_count > 0)}")
-    lines.append(f"   Документов извлечено: {docs_count}")
-    lines.append(f"   Символов: {chars_total:,}")
-    lines.append(f"   Время файла: {time.time() - t0:.1f}с")
-    _log("\n".join(lines))
+    _log(f"   Статус: {_status_label(ext, docs_count > 0)}")
+    _log(f"   Документов извлечено: {docs_count}")
+    _log(f"   Символов: {chars_total:,}")
+    _log(f"   Время файла: {time.time() - t0:.1f}с")
     return extracted
 
 

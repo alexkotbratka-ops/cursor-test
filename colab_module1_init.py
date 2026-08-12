@@ -153,7 +153,7 @@ OCR_MIN_ALPHA_RATIO = 0.35           # доля букв среди непроб
 OCR_IMAGE_AREA_RATIO = 0.55          # доля площади страницы под картинками
 OCR_DPI = 200                        # dpi для pdf2image / pixmap (было 300)
 DOCX_OCR_MIN_TEXT_CHARS = 200       # если в DOCX уже ≥ N символов — OCR картинок не нужен
-ARCHIVE_MAX_DEPTH = 2                 # макс. глубина вложенных архивов
+ARCHIVE_MAX_DEPTH = 4                 # макс. глубина вложенных архивов
 
 SUPPORTED_DOCS = {
     # документы
@@ -1104,16 +1104,58 @@ def extract_text_from_dwg(file_bytes: bytes, filename: str = "") -> str:
 # Распаковка архивов (рекурсивно)
 # =============================================================================
 
+def _fix_zip_member_name(name: str, info: "zipfile.ZipInfo") -> str:
+    """
+    Имена в ZIP с Windows (часто CP866) без UTF-8 флага приходят как mojibake.
+    Пробуем восстановить кириллицу.
+    """
+    name = name.replace("\\", "/")
+    # Бит 11 = UTF-8
+    if info.flag_bits & 0x800:
+        return name
+    try:
+        raw = name.encode("cp437", errors="strict")
+    except Exception:
+        return name
+    for enc in ("cp866", "cp1251", "utf-8"):
+        try:
+            decoded = raw.decode(enc)
+            # предпочитаем вариант с кириллицей / читаемыми символами
+            if any("а" <= ch.lower() <= "я" or ch in "ёЁ" for ch in decoded):
+                return decoded
+            if enc == "utf-8":
+                return decoded
+        except Exception:
+            continue
+    return name
+
+
 def _iter_archive_members_zip(file_bytes: bytes) -> List[Tuple[str, bytes]]:
+    """Распаковка ZIP с поддержкой кириллических имён (CP866/CP1251)."""
     members: List[Tuple[str, bytes]] = []
-    with zipfile.ZipFile(io.BytesIO(file_bytes)) as zf:
-        for name in zf.namelist():
-            if name.endswith("/") or "__MACOSX" in name or Path(name).name.startswith("."):
+    try:
+        zf = zipfile.ZipFile(io.BytesIO(file_bytes))
+    except Exception as e:
+        print(f"  ❌ ZIP не открылся: {e}")
+        return members
+
+    with zf:
+        infos = zf.infolist()
+        print(f"  📦 ZIP: записей в архиве = {len(infos)}")
+        for info in infos:
+            name = _fix_zip_member_name(info.filename, info)
+            if name.endswith("/") or info.is_dir():
+                print(f"     · (папка) {name}")
+                continue
+            if "__MACOSX" in name or Path(name).name.startswith("."):
                 continue
             try:
-                members.append((name, zf.read(name)))
+                data = zf.read(info)
+                members.append((name, data))
+                print(f"     · {name} [{len(data):,} байт]")
             except Exception as e:
                 print(f"  ⚠️ Не удалось прочитать из ZIP: {name}: {e}")
+    print(f"  📦 ZIP: извлечено файлов = {len(members)}")
     return members
 
 
@@ -1226,7 +1268,7 @@ def extract_documents_from_bytes(
     depth — уровень вложенности архива (0 = исходный файл).
     ARCHIVE_MAX_DEPTH ограничивает распаковку (по умолчанию 2).
     """
-    max_depth = int(globals().get("ARCHIVE_MAX_DEPTH", 2) or 2)
+    max_depth = int(globals().get("ARCHIVE_MAX_DEPTH", 4) or 4)
     ext = file_ext(filename)
     results: List[Tuple[str, str]] = []
 
