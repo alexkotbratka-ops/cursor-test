@@ -152,7 +152,8 @@ OCR_MIN_CHARS_PER_PAGE = 30          # меньше → страница счи�
 OCR_MIN_ALPHA_RATIO = 0.35           # доля букв среди непробельных символов
 OCR_IMAGE_AREA_RATIO = 0.55          # доля площади страницы под картинками
 OCR_DPI = 200                        # dpi для pdf2image / pixmap (было 300)
-OCR_PDF_FORCE_FULL_IF_AVG_BELOW = 15 # средний символов/стр. → полный OCR всего PDF
+DOCX_OCR_MIN_TEXT_CHARS = 200       # если в DOCX уже ≥ N символов — OCR картинок не нужен
+ARCHIVE_MAX_DEPTH = 2                 # макс. глубина вложенных архивов
 
 SUPPORTED_DOCS = {
     # документы
@@ -398,7 +399,10 @@ def extract_text_from_pdf(file_bytes: bytes, filename: str = "") -> str:
 
 
 def extract_text_from_docx(file_bytes: bytes, filename: str = "") -> str:
-    """DOCX: текст + OCR встроенных изображений (сканы писем внутри Word)."""
+    """
+    DOCX: сначала цифровой текст; OCR встроенных изображений —
+    только если текста мало (иначе сканы-логотипы сильно замедляют).
+    """
     parts: List[str] = []
     try:
         doc = Document(io.BytesIO(file_bytes))
@@ -411,7 +415,13 @@ def extract_text_from_docx(file_bytes: bytes, filename: str = "") -> str:
                 if cells:
                     parts.append(" | ".join(cells))
 
-        # встроенные картинки (сканы внутри docx)
+        digital = "\n".join(parts).strip()
+        # ускорение: если текста достаточно — не гоняем OCR по всем картинкам
+        min_chars = int(globals().get("DOCX_OCR_MIN_TEXT_CHARS", 200) or 200)
+        if len(digital) >= min_chars:
+            return digital
+
+        # мало текста → возможно скан внутри DOCX
         try:
             img_idx = 0
             for rel in doc.part.rels.values():
@@ -426,7 +436,7 @@ def extract_text_from_docx(file_bytes: bytes, filename: str = "") -> str:
                 except Exception:
                     continue
             if img_idx:
-                print(f"  🖼️ DOCX {filename}: OCR для {img_idx} изображений")
+                print(f"  🖼️ DOCX {filename}: OCR для {img_idx} изображений (мало текста: {len(digital)} симв.)")
         except Exception as e:
             print(f"  ⚠️ DOCX images OCR {filename}: {e}")
     except Exception as e:
@@ -1206,17 +1216,28 @@ def unpack_archive(file_bytes: bytes, filename: str) -> List[Tuple[str, bytes]]:
     return []
 
 
-def extract_documents_from_bytes(file_bytes: bytes, filename: str) -> List[Tuple[str, str]]:
+def extract_documents_from_bytes(
+    file_bytes: bytes,
+    filename: str,
+    depth: int = 0,
+) -> List[Tuple[str, str]]:
     """
     Извлекает документы из файла или архива (рекурсивно).
-    Возвращает список (источник, текст).
+    depth — уровень вложенности архива (0 = исходный файл).
+    ARCHIVE_MAX_DEPTH ограничивает распаковку (по умолчанию 2).
     """
+    max_depth = int(globals().get("ARCHIVE_MAX_DEPTH", 2) or 2)
     ext = file_ext(filename)
     results: List[Tuple[str, str]] = []
 
     if ext in SUPPORTED_ARCHIVES:
+        if depth >= max_depth:
+            print(f"  ⏭️ Архив глубже {max_depth} ур. — пропуск: {filename}")
+            return results
         for inner_name, data in unpack_archive(file_bytes, filename):
-            nested = extract_documents_from_bytes(data, f"{filename}/{inner_name}")
+            nested = extract_documents_from_bytes(
+                data, f"{filename}/{inner_name}", depth=depth + 1
+            )
             results.extend(nested)
         return results
 

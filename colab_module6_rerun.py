@@ -1,15 +1,22 @@
 # =============================================================================
-# МОДУЛЬ 6 — Повторный анализ тендера (Google Colab)
+# МОДУЛЬ 6 — Повторный анализ тендера (Google Colab, ускоренный)
 # Выполняйте ПОСЛЕ модуля 5 (или модулей 1–4), когда зависимости и API-ключ
 # уже есть в сессии.
 #
 # НЕ переустанавливает библиотеки и НЕ запрашивает API-ключ.
+# НЕ меняет OCR dpi (качество сканов PDF сохраняется).
+#
+# Ускорения индексации:
+#   • DOCX: OCR картинок только если текста мало (< 200 симв.)
+#   • архивы: глубина ≤ 2
+#   • таймаут на файл: 120с
+#   • прогресс: текущий файл + ETA
 #
 # Последовательно:
 #   1) очистка uploaded_files / rag_index
 #   2) загрузка новых файлов (files.upload)
-#   3) OCR / извлечение / индексация (логика модуля 3)
-#   4) анализ 86 вопросов + классификация + согласования (логика модуля 4)
+#   3) OCR / извлечение / индексация
+#   4) анализ 86 вопросов + классификация + согласования
 #   5) TXT-отчёт + download + ссылка /content/...
 # =============================================================================
 
@@ -179,7 +186,7 @@ _mark("upload_end")
 print(f"⏱️ Загрузка: {_fmt_dur(_elapsed('upload_start', 'upload_end'))}")
 
 # =============================================================================
-# ЭТАП 3/4 — Индексация (логика модуля 3)
+# ЭТАП 3/4 — Индексация (логика модуля 3) + ускорения
 # =============================================================================
 _mark("index_start")
 _status("этап 3/4 — OCR / извлечение / индексация")
@@ -188,31 +195,135 @@ print("ЭТАП 3/4 — Извлечение текста, OCR, индексац
 print("=" * 70)
 
 import hashlib
+import io
 import re
 import threading
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import ThreadPoolExecutor, TimeoutError as FuturesTimeoutError, as_completed
 from collections import defaultdict
 
+try:
+    from docx import Document as _DocxDocument
+except Exception:
+    _DocxDocument = None
 
 # =============================================================================
-# 1) OCR + размер чанков + TOP_K (переопределяем настройки модуля 1)
+# Ускорения модуля 6 (качество OCR dpi НЕ меняем)
 # =============================================================================
 
-OCR_DPI = 200
+DOCX_OCR_MIN_TEXT_CHARS = 200   # OCR картинок в DOCX только если текста мало
+ARCHIVE_MAX_DEPTH = 2           # глубина вложенных архивов
+FILE_PROCESS_TIMEOUT = 120      # сек. на один загруженный файл
+# OCR_DPI не трогаем — берём из сессии / ниже
+
+OCR_DPI = int(globals().get("OCR_DPI", 200) or 200)
 OCR_PDF_FORCE_FULL_IF_AVG_BELOW = 15
-OCR_MIN_CHARS_PER_PAGE = 30          # как в модуле 1 (было 80)
+OCR_MIN_CHARS_PER_PAGE = 30
 OCR_MIN_ALPHA_RATIO = 0.25
 OCR_IMAGE_AREA_RATIO = 0.70
 
-CHUNK_SIZE = 600                     # было 800
+CHUNK_SIZE = 600
 CHUNK_OVERLAP = 100
-TOP_K = 5                            # как в модуле 4/5
+TOP_K = 5
+
+_PRINT_LOCK = threading.Lock()
+_CURRENT_FILE = {"name": "—"}
+
+
+def _log(*args, **kwargs):
+    with _PRINT_LOCK:
+        print(*args, **kwargs)
+
+
+def extract_text_from_docx(file_bytes: bytes, filename: str = "") -> str:
+    """
+    Быстрый DOCX: OCR встроенных изображений только если цифрового текста мало.
+    Переопределяет функцию сессии на время модуля 6.
+    """
+    if _DocxDocument is None:
+        return ""
+    parts: List[str] = []
+    try:
+        doc = _DocxDocument(io.BytesIO(file_bytes))
+        for para in doc.paragraphs:
+            if para.text.strip():
+                parts.append(para.text)
+        for table in doc.tables:
+            for row in table.rows:
+                cells = [c.text.strip() for c in row.cells if c.text.strip()]
+                if cells:
+                    parts.append(" | ".join(cells))
+
+        digital = "\n".join(parts).strip()
+        if len(digital) >= DOCX_OCR_MIN_TEXT_CHARS:
+            _log(f"  ⏩ DOCX {filename}: текст есть ({len(digital)} симв.) — OCR картинок пропущен")
+            return digital
+
+        # мало текста → OCR картинок (возможный скан)
+        if "extract_text_from_image" not in globals():
+            return digital
+        try:
+            img_idx = 0
+            for rel in doc.part.rels.values():
+                try:
+                    if "image" not in getattr(rel, "reltype", ""):
+                        continue
+                    blob = rel.target_part.blob
+                    img_idx += 1
+                    ocr_text = extract_text_from_image(blob, f"{filename}#img{img_idx}")
+                    if ocr_text:
+                        parts.append(f"[Изображение {img_idx} | OCR]\n{ocr_text}")
+                except Exception:
+                    continue
+            if img_idx:
+                _log(f"  🖼️ DOCX {filename}: OCR {img_idx} изобр. (мало текста: {len(digital)} симв.)")
+        except Exception as e:
+            _log(f"  ⚠️ DOCX images OCR {filename}: {e}")
+    except Exception as e:
+        _log(f"  ❌ Ошибка DOCX {filename}: {e}")
+    return "\n".join(parts)
+
+
+def extract_documents_from_bytes(
+    file_bytes: bytes,
+    filename: str,
+    depth: int = 0,
+) -> List[Tuple[str, str]]:
+    """Распаковка архивов с ограничением глубины ARCHIVE_MAX_DEPTH."""
+    ext = file_ext(filename) if "file_ext" in globals() else _safe_ext(filename)
+    results: List[Tuple[str, str]] = []
+
+    if ext in SUPPORTED_ARCHIVES:
+        if depth >= ARCHIVE_MAX_DEPTH:
+            _log(f"  ⏭️ Архив глубже {ARCHIVE_MAX_DEPTH} ур. — пропуск: {filename}")
+            return results
+        try:
+            members = unpack_archive(file_bytes, filename)
+        except Exception as e:
+            _log(f"  ❌ Ошибка распаковки {filename}: {e}")
+            return results
+        for inner_name, data in members:
+            nested = extract_documents_from_bytes(
+                data, f"{filename}/{inner_name}", depth=depth + 1
+            )
+            results.extend(nested)
+        return results
+
+    text = extract_text(file_bytes, filename) if "extract_text" in globals() else ""
+    if (text or "").strip():
+        results.append((filename, text))
+    return results
+
+
+print(
+    f"⚡ Ускорения: DOCX OCR только при тексте < {DOCX_OCR_MIN_TEXT_CHARS} симв.; "
+    f"архивы ≤ {ARCHIVE_MAX_DEPTH} ур.; таймаут файла {FILE_PROCESS_TIMEOUT}с"
+)
+print(f"⚙️ OCR: dpi={OCR_DPI} (без изменений), порог стр.={OCR_MIN_CHARS_PER_PAGE}")
+print(f"⚙️ Индекс: chunk_size={CHUNK_SIZE}, overlap={CHUNK_OVERLAP}, TOP_K={TOP_K}")
 
 
 def page_needs_ocr(page, digital_text: str) -> bool:
-    """
-    Быстрая проверка: если цифровой текст уже есть — OCR не нужен.
-    """
+    """Быстрая проверка: если цифровой текст уже есть — OCR не нужен."""
     text = (digital_text or "").strip()
     if len(text) >= OCR_MIN_CHARS_PER_PAGE:
         return False
@@ -237,25 +348,12 @@ def page_needs_ocr(page, digital_text: str) -> bool:
 # Пересоздаём индекс с новым размером чанка
 rag_index = RAGIndex(chunk_size=CHUNK_SIZE, chunk_overlap=CHUNK_OVERLAP)
 
-print(
-    f"⚙️ OCR: dpi={OCR_DPI}, OCR только если текст < {OCR_MIN_CHARS_PER_PAGE} симв/стр"
-)
-print(f"⚙️ Индекс: chunk_size={CHUNK_SIZE}, overlap={CHUNK_OVERLAP}, TOP_K={TOP_K}")
-
-
 # =============================================================================
-# Утилиты
+# Утилиты индексации
 # =============================================================================
 
-_PRINT_LOCK = threading.Lock()
 
-
-def _log(*args, **kwargs):
-    with _PRINT_LOCK:
-        print(*args, **kwargs)
-
-
-def _progress_line(done: int, total: int, t0: float, label: str = "") -> str:
+def _progress_line(done: int, total: int, t0: float, label: str = "", current: str = "") -> str:
     total = max(1, total)
     pct = 100.0 * done / total
     width = 12
@@ -270,8 +368,14 @@ def _progress_line(done: int, total: int, t0: float, label: str = "") -> str:
             eta_s = f"{int(round(eta / 60))} мин."
     else:
         eta_s = "оценка…"
+    cur = current or _CURRENT_FILE.get("name") or "—"
+    if len(cur) > 40:
+        cur = cur[:37] + "..."
     prefix = f"{label} " if label else ""
-    return f"{prefix}[{bar}] {pct:.0f}% ({eta_s} осталось)"
+    return (
+        f"🔄 СТАТУС: {prefix}файл «{cur}»  | [{bar}] {pct:.0f}% "
+        f"({done}/{total}, осталось {eta_s}, прошло {_fmt_dur(elapsed)})"
+    )
 
 
 def _fmt_size(n: int) -> str:
@@ -327,7 +431,6 @@ def dedupe_uploaded(files: Dict[str, bytes]) -> Dict[str, bytes]:
     seen_name: Set[str] = set()
     skipped = 0
 
-    # стабильный порядок
     for name, data in files.items():
         h = _md5(data)
         cname = _canon_basename(name)
@@ -349,7 +452,6 @@ def dedupe_uploaded(files: Dict[str, bytes]) -> Dict[str, bytes]:
     return unique
 
 
-# Глобальные множества для дедупа внутри архивов (на весь прогон модуля 3)
 _SEEN_INNER_HASHES: Set[str] = set()
 _SEEN_INNER_NAMES: Set[str] = set()
 _DEDUP_LOCK = threading.Lock()
@@ -359,8 +461,6 @@ def _register_or_skip_inner(name: str, data: bytes) -> bool:
     """
     Дедуп ТОЛЬКО для файлов внутри архивов.
     True = это дубликат, пропустить.
-    False = новый файл, зарегистрирован.
-    Не использовать для загрузок верхнего уровня (их чистит dedupe_uploaded).
     """
     h = _md5(data)
     cname = _canon_basename(name)
@@ -373,10 +473,6 @@ def _register_or_skip_inner(name: str, data: bytes) -> bool:
         _SEEN_INNER_NAMES.add(cname)
         return False
 
-
-# =============================================================================
-# Извлечение текста
-# =============================================================================
 
 def _read_document_bytes(file_bytes: bytes, filename: str) -> str:
     ext = _safe_ext(filename)
@@ -417,12 +513,15 @@ def _status_label(ext: str, ok: bool) -> str:
     return "пропущен (пустой текст / не удалось прочитать)"
 
 
-def _extract_from_any(file_bytes: bytes, filename: str) -> List[Tuple[str, str]]:
-    """Рекурсивно извлекает документы; дубликаты внутри архивов пропускает."""
+def _extract_from_any(file_bytes: bytes, filename: str, depth: int = 0) -> List[Tuple[str, str]]:
+    """Рекурсивно извлекает документы; глубина архивов ограничена ARCHIVE_MAX_DEPTH."""
     ext = _safe_ext(filename)
     results: List[Tuple[str, str]] = []
 
     if ext in SUPPORTED_ARCHIVES:
+        if depth >= ARCHIVE_MAX_DEPTH:
+            _log(f"  ⏭️ Архив глубже {ARCHIVE_MAX_DEPTH} ур. — пропуск: {filename}")
+            return results
         try:
             members = unpack_archive(file_bytes, filename)
         except Exception as e:
@@ -431,14 +530,12 @@ def _extract_from_any(file_bytes: bytes, filename: str) -> List[Tuple[str, str]]
         for inner_name, data in members:
             inner_norm = str(inner_name).replace("\\", "/")
             full = f"{filename}/{inner_norm}"
-            # дедуп ТОЛЬКО для файлов внутри архивов
             if _register_or_skip_inner(inner_norm, data):
                 _log(f"  ⏭️ Пропуск дубликата: {inner_norm} (уже обработан)")
                 continue
-            results.extend(_extract_from_any(data, full))
+            results.extend(_extract_from_any(data, full, depth=depth + 1))
         return results
 
-    # обычный файл (уже прошёл дедуп на уровне архива, либо это вложенный вызов)
     text = _read_document_bytes(file_bytes, filename)
     if text:
         results.append((filename, text))
@@ -447,9 +544,11 @@ def _extract_from_any(file_bytes: bytes, filename: str) -> List[Tuple[str, str]]
 
 def _process_uploaded_file(filename: str, file_bytes: bytes) -> List[Tuple[str, str]]:
     """Читает один загруженный файл/архив. Потокобезопасно по логам."""
+    _CURRENT_FILE["name"] = _basename(filename)
     ext = _safe_ext(filename)
     size = len(file_bytes)
     extracted: List[Tuple[str, str]] = []
+    t0 = time.time()
 
     lines = [
         "=" * 80,
@@ -459,7 +558,7 @@ def _process_uploaded_file(filename: str, file_bytes: bytes) -> List[Tuple[str, 
     ]
 
     if ext in SUPPORTED_ARCHIVES:
-        lines.append("   Содержимое архива:")
+        lines.append("   Содержимое архива (глубина ≤ {0}):".format(ARCHIVE_MAX_DEPTH))
         try:
             members = unpack_archive(file_bytes, filename)
         except Exception as e:
@@ -470,18 +569,21 @@ def _process_uploaded_file(filename: str, file_bytes: bytes) -> List[Tuple[str, 
             lines.append("   ⚠️ Архив пуст или не удалось прочитать.")
         else:
             for inner_name, data in members:
+                if time.time() - t0 > FILE_PROCESS_TIMEOUT:
+                    lines.append(f"   ⏱️ Таймаут {FILE_PROCESS_TIMEOUT}с — остаток архива пропущен")
+                    break
                 inner_norm = str(inner_name).replace("\\", "/")
                 inner_ext = _safe_ext(inner_norm)
                 prefix = f"   • {inner_norm} [{_fmt_size(len(data))}]"
                 source = f"{filename}/{inner_norm}"
 
-                # дедуп ТОЛЬКО внутри архивов
                 if _register_or_skip_inner(inner_norm, data):
                     lines.append(f"{prefix} → ⏭️ Пропуск дубликата: {inner_norm} (уже обработан)")
                     continue
 
                 if inner_ext in SUPPORTED_ARCHIVES:
-                    nested = _extract_from_any(data, source)
+                    # depth=1: мы уже на 1-м уровне внутри upload-архива
+                    nested = _extract_from_any(data, source, depth=1)
                     extracted.extend(nested)
                     if nested:
                         chars = sum(len(t) for _, t in nested)
@@ -489,7 +591,7 @@ def _process_uploaded_file(filename: str, file_bytes: bytes) -> List[Tuple[str, 
                             f"{prefix} → вложенный архив, извлечено {len(nested)} док., {chars:,} символов"
                         )
                     else:
-                        lines.append(f"{prefix} → вложенный архив, пусто / только дубли")
+                        lines.append(f"{prefix} → вложенный архив, пусто / только дубли / лимит глубины")
                     continue
 
                 text = _read_document_bytes(data, inner_norm)
@@ -502,17 +604,17 @@ def _process_uploaded_file(filename: str, file_bytes: bytes) -> List[Tuple[str, 
         docs_count = len(extracted)
         chars_total = sum(len(t) for _, t in extracted)
         lines.append(f"   Итого по архиву: документов={docs_count}, символов={chars_total:,}")
+        lines.append(f"   Время файла: {time.time() - t0:.1f}с")
         _log("\n".join(lines))
         return extracted
 
-    # Файл верхнего уровня: уже уникален после dedupe_uploaded (MD5 + basename).
-    # НЕ вызываем _register_or_skip_inner — иначе все upload'ы ошибочно станут «дублями».
+    # Файл верхнего уровня — уже уникален после dedupe_uploaded
     text = _read_document_bytes(file_bytes, filename)
     if text:
         extracted = [(filename, text)]
     else:
         try:
-            extracted = extract_documents_from_bytes(file_bytes, filename) or []
+            extracted = extract_documents_from_bytes(file_bytes, filename, depth=0) or []
         except Exception:
             extracted = []
 
@@ -521,6 +623,7 @@ def _process_uploaded_file(filename: str, file_bytes: bytes) -> List[Tuple[str, 
     lines.append(f"   Статус: {_status_label(ext, docs_count > 0)}")
     lines.append(f"   Документов извлечено: {docs_count}")
     lines.append(f"   Символов: {chars_total:,}")
+    lines.append(f"   Время файла: {time.time() - t0:.1f}с")
     _log("\n".join(lines))
     return extracted
 
@@ -533,19 +636,18 @@ _doc_ok = ".doc" in SUPPORTED_DOCS if "SUPPORTED_DOCS" in globals() else False
 _antiword_fn = "extract_text_from_doc" in globals()
 
 print(f"🔍 Чтение и индексация")
-print(f"   .doc в SUPPORTED_DOCS: {'да' if _doc_ok else 'нет — перезапустите модуль 1'}")
-print(f"   extract_text_from_doc: {'да' if _antiword_fn else 'нет — перезапустите модуль 1'}")
+print(f"   .doc в SUPPORTED_DOCS: {'да' if _doc_ok else 'нет — перезапустите модуль 1/5'}")
+print(f"   extract_text_from_doc: {'да' if _antiword_fn else 'нет — перезапустите модуль 1/5'}")
 print()
 
-# дедуп верхнего уровня — ТОЛЬКО по MD5 / каноническому basename (реальные дубли)
 unique_files = dedupe_uploaded(dict(uploaded_files))
 
-# множества внутренних дублей — ТОЛЬКО для содержимого архивов (пусто на старте)
 _SEEN_INNER_HASHES.clear()
 _SEEN_INNER_NAMES.clear()
 
 MAX_WORKERS = min(4, max(1, len(unique_files)))
-print(f"🚀 Параллельная обработка: {len(unique_files)} файлов, workers={MAX_WORKERS}\n")
+print(f"🚀 Параллельная обработка: {len(unique_files)} файлов, workers={MAX_WORKERS}")
+print(f"   таймаут на файл: {FILE_PROCESS_TIMEOUT}с\n")
 
 documents: List[Tuple[str, str]] = []
 errors = []
@@ -560,14 +662,22 @@ with ThreadPoolExecutor(max_workers=MAX_WORKERS) as pool:
     }
     for fut in as_completed(futures):
         name = futures[fut]
+        short = _basename(name)
+        _CURRENT_FILE["name"] = short
+        _log(_progress_line(_done, _total_files, _t0, label="Индексация", current=short))
         try:
-            docs = fut.result()
+            docs = fut.result(timeout=FILE_PROCESS_TIMEOUT)
             documents.extend(docs)
+        except FuturesTimeoutError:
+            errors.append((name, f"таймаут {FILE_PROCESS_TIMEOUT}с"))
+            _log(f"⏱️ Таймаут {FILE_PROCESS_TIMEOUT}с: {name} — файл пропущен")
         except Exception as e:
             errors.append((name, str(e)))
             _log(f"❌ Ошибка обработки {name}: {e}")
         _done += 1
-        _log(_progress_line(_done, _total_files, _t0, label="Индексация"))
+        _log(_progress_line(_done, _total_files, _t0, label="Индексация", current=short))
+
+_CURRENT_FILE["name"] = "сборка индекса"
 
 # дополнительная дедупликация документов по (basename, hash текста)
 _final_docs: List[Tuple[str, str]] = []
