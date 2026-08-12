@@ -3,7 +3,7 @@
 # Выполняйте строго ПОСЛЕ модуля 2.
 # Оптимизации:
 #   1) дедупликация по basename + MD5 до обработки
-#   2) OCR: dpi=200, порог 30 симв — если текст есть, OCR не запускаем
+#   2) OCR: dpi=200, rus+eng, psm=6; смешанный контент — OCR при изображениях/графике
 #   3) chunk_size=600, TOP_K=6
 #   4) параллельная обработка + прогресс-бар с ETA
 # =============================================================================
@@ -34,9 +34,10 @@ if "rag_index" not in globals() or not isinstance(rag_index, RAGIndex):
 
 OCR_DPI = 200
 OCR_PDF_FORCE_FULL_IF_AVG_BELOW = 15
-OCR_MIN_CHARS_PER_PAGE = 30          # как в модуле 1 (было 80)
+OCR_MIN_CHARS_PER_PAGE = 30          # мало текста → OCR
 OCR_MIN_ALPHA_RATIO = 0.25
-OCR_IMAGE_AREA_RATIO = 0.70
+OCR_IMAGE_AREA_RATIO = 0.08          # любая заметная картинка → OCR
+OCR_OVERLAP_SKIP = 0.75
 
 CHUNK_SIZE = 600                     # было 800
 CHUNK_OVERLAP = 100
@@ -45,13 +46,27 @@ TOP_K = 6                            # 5–8 для поиска в сессии
 
 def page_needs_ocr(page, digital_text: str) -> bool:
     """
-    Быстрая проверка: если цифровой текст уже есть — OCR не нужен.
+    OCR при смешанном контенте: мало текста ИЛИ есть изображения/графика.
     """
     text = (digital_text or "").strip()
-    if len(text) >= OCR_MIN_CHARS_PER_PAGE:
-        return False
-    if not text:
+    chars = len(re.sub(r"\s+", "", text))
+    if chars < OCR_MIN_CHARS_PER_PAGE:
         return True
+    try:
+        if page.get_images(full=True):
+            return True
+    except Exception:
+        pass
+    try:
+        if page.get_image_info(xrefs=True):
+            return True
+    except Exception:
+        pass
+    try:
+        if len(page.get_drawings() or []) >= 5:
+            return True
+    except Exception:
+        pass
     try:
         rect = page.rect
         page_area = abs(rect.width * rect.height) or 1.0
@@ -62,17 +77,19 @@ def page_needs_ocr(page, digital_text: str) -> bool:
                 continue
             x0, y0, x1, y1 = bbox
             img_area += abs((x1 - x0) * (y1 - y0))
-        ratio = min(img_area / page_area, 1.0)
+        if (img_area / page_area) >= OCR_IMAGE_AREA_RATIO:
+            return True
     except Exception:
-        ratio = 0.0
-    return ratio >= OCR_IMAGE_AREA_RATIO and len(text) < OCR_MIN_CHARS_PER_PAGE
+        pass
+    return False
 
 
 # Пересоздаём индекс с новым размером чанка
 rag_index = RAGIndex(chunk_size=CHUNK_SIZE, chunk_overlap=CHUNK_OVERLAP)
 
 print(
-    f"⚙️ OCR: dpi={OCR_DPI}, OCR только если текст < {OCR_MIN_CHARS_PER_PAGE} симв/стр"
+    f"⚙️ OCR: dpi={OCR_DPI}, lang=rus+eng, psm=6; "
+    f"запуск при изображениях/графике или тексте < {OCR_MIN_CHARS_PER_PAGE} симв/стр"
 )
 print(f"⚙️ Индекс: chunk_size={CHUNK_SIZE}, overlap={CHUNK_OVERLAP}, TOP_K={TOP_K}")
 

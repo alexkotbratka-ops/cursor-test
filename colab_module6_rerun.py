@@ -210,16 +210,16 @@ except Exception:
 # Ускорения модуля 6 (качество OCR dpi НЕ меняем)
 # =============================================================================
 
-DOCX_OCR_MIN_TEXT_CHARS = 200   # OCR картинок в DOCX только если текста мало
-ARCHIVE_MAX_DEPTH = 4           # глубина вложенных архивов (было 2)
-FILE_PROCESS_TIMEOUT = 180      # сек. на один загруженный файл (архивы могут быть тяжёлыми)
+ARCHIVE_MAX_DEPTH = 4           # глубина вложенных архивов
+FILE_PROCESS_TIMEOUT = 180      # сек. на один загруженный файл
 # OCR_DPI не трогаем — берём из сессии / ниже
 
 OCR_DPI = int(globals().get("OCR_DPI", 200) or 200)
 OCR_PDF_FORCE_FULL_IF_AVG_BELOW = 15
 OCR_MIN_CHARS_PER_PAGE = 30
 OCR_MIN_ALPHA_RATIO = 0.25
-OCR_IMAGE_AREA_RATIO = 0.70
+OCR_IMAGE_AREA_RATIO = 0.08
+OCR_OVERLAP_SKIP = 0.75
 
 CHUNK_SIZE = 600
 CHUNK_OVERLAP = 100
@@ -351,46 +351,53 @@ def unpack_archive(file_bytes: bytes, filename: str) -> List[Tuple[str, bytes]]:
 
 def extract_text_from_docx(file_bytes: bytes, filename: str = "") -> str:
     """
-    Быстрый DOCX: OCR встроенных изображений только если цифрового текста мало.
-    Переопределяет функцию сессии на время модуля 6.
+    DOCX: цифровой текст + OCR ВСЕХ встроенных изображений (без пропуска при наличии текста).
+    OCR дополняет, не дублирует.
     """
     if _DocxDocument is None:
         return ""
     parts: List[str] = []
+    digital_parts: List[str] = []
     try:
         doc = _DocxDocument(io.BytesIO(file_bytes))
         for para in doc.paragraphs:
             if para.text.strip():
-                parts.append(para.text)
+                digital_parts.append(para.text)
         for table in doc.tables:
             for row in table.rows:
                 cells = [c.text.strip() for c in row.cells if c.text.strip()]
                 if cells:
-                    parts.append(" | ".join(cells))
+                    digital_parts.append(" | ".join(cells))
+        parts.extend(digital_parts)
+        digital_blob = "\n".join(digital_parts)
 
-        digital = "\n".join(parts).strip()
-        if len(digital) >= DOCX_OCR_MIN_TEXT_CHARS:
-            _log(f"  ⏩ DOCX {filename}: текст есть ({len(digital)} симв.) — OCR картинок пропущен")
-            return digital
-
-        # мало текста → OCR картинок (возможный скан)
         if "extract_text_from_image" not in globals():
-            return digital
+            return "\n".join(parts)
         try:
-            img_idx = 0
+            image_rels = []
             for rel in doc.part.rels.values():
                 try:
-                    if "image" not in getattr(rel, "reltype", ""):
-                        continue
-                    blob = rel.target_part.blob
-                    img_idx += 1
-                    ocr_text = extract_text_from_image(blob, f"{filename}#img{img_idx}")
-                    if ocr_text:
-                        parts.append(f"[Изображение {img_idx} | OCR]\n{ocr_text}")
+                    if "image" in getattr(rel, "reltype", ""):
+                        image_rels.append(rel)
                 except Exception:
                     continue
-            if img_idx:
-                _log(f"  🖼️ DOCX {filename}: OCR {img_idx} изобр. (мало текста: {len(digital)} симв.)")
+            total_imgs = len(image_rels)
+            if total_imgs:
+                _log(f"  🖼️ DOCX {filename}: найдено изображений {total_imgs} — запускаем OCR")
+            for img_idx, rel in enumerate(image_rels, start=1):
+                try:
+                    blob = rel.target_part.blob
+                    _log(f"  🔍 OCR: изображение {img_idx} из {total_imgs} — {filename}")
+                    ocr_text = extract_text_from_image(blob, f"{filename}#img{img_idx}")
+                    if "ocr_supplement_text" in globals():
+                        extra = ocr_supplement_text(digital_blob, ocr_text)
+                    else:
+                        extra = (ocr_text or "").strip()
+                    if extra:
+                        parts.append(f"[Изображение {img_idx} | OCR]\n{extra}")
+                        digital_blob = digital_blob + "\n" + extra
+                except Exception:
+                    continue
         except Exception as e:
             _log(f"  ⚠️ DOCX images OCR {filename}: {e}")
     except Exception as e:
@@ -430,20 +437,37 @@ def extract_documents_from_bytes(
 
 
 print(
-    f"⚡ Ускорения: DOCX OCR только при тексте < {DOCX_OCR_MIN_TEXT_CHARS} симв.; "
-    f"архивы ≤ {ARCHIVE_MAX_DEPTH} ур.; таймаут файла {FILE_PROCESS_TIMEOUT}с"
+    f"⚡ Архивы ≤ {ARCHIVE_MAX_DEPTH} ур.; таймаут файла {FILE_PROCESS_TIMEOUT}с; "
+    f"OCR смешанного контента (PDF/DOCX с изображениями)"
 )
-print(f"⚙️ OCR: dpi={OCR_DPI} (без изменений), порог стр.={OCR_MIN_CHARS_PER_PAGE}")
+print(
+    f"⚙️ OCR: dpi={OCR_DPI}, lang=rus+eng, psm=6; "
+    f"запуск при изображениях/графике или тексте < {OCR_MIN_CHARS_PER_PAGE} симв/стр"
+)
 print(f"⚙️ Индекс: chunk_size={CHUNK_SIZE}, overlap={CHUNK_OVERLAP}, TOP_K={TOP_K}")
 
 
 def page_needs_ocr(page, digital_text: str) -> bool:
-    """Быстрая проверка: если цифровой текст уже есть — OCR не нужен."""
+    """OCR при смешанном контенте: мало текста ИЛИ есть изображения/графика."""
     text = (digital_text or "").strip()
-    if len(text) >= OCR_MIN_CHARS_PER_PAGE:
-        return False
-    if not text:
+    chars = len(re.sub(r"\s+", "", text))
+    if chars < OCR_MIN_CHARS_PER_PAGE:
         return True
+    try:
+        if page.get_images(full=True):
+            return True
+    except Exception:
+        pass
+    try:
+        if page.get_image_info(xrefs=True):
+            return True
+    except Exception:
+        pass
+    try:
+        if len(page.get_drawings() or []) >= 5:
+            return True
+    except Exception:
+        pass
     try:
         rect = page.rect
         page_area = abs(rect.width * rect.height) or 1.0
@@ -454,10 +478,11 @@ def page_needs_ocr(page, digital_text: str) -> bool:
                 continue
             x0, y0, x1, y1 = bbox
             img_area += abs((x1 - x0) * (y1 - y0))
-        ratio = min(img_area / page_area, 1.0)
+        if (img_area / page_area) >= OCR_IMAGE_AREA_RATIO:
+            return True
     except Exception:
-        ratio = 0.0
-    return ratio >= OCR_IMAGE_AREA_RATIO and len(text) < OCR_MIN_CHARS_PER_PAGE
+        pass
+    return False
 
 
 # Пересоздаём индекс с новым размером чанка

@@ -225,11 +225,12 @@ DEEPSEEK_TIMEOUT = 60                # сек. на ответ API (было 120
 
 # Пороги детекции сканов / «бедного» текста
 # Быстрая проверка: если цифровой текст уже есть (≥ порога) — OCR не запускаем.
-OCR_MIN_CHARS_PER_PAGE = 30          # меньше → страница считается сканом (было 80)
+OCR_MIN_CHARS_PER_PAGE = 30          # мало текста → страница почти наверняка скан
 OCR_MIN_ALPHA_RATIO = 0.35           # доля букв среди непробельных символов
-OCR_IMAGE_AREA_RATIO = 0.55          # доля площади страницы под картинками
-OCR_DPI = 200                        # dpi для pdf2image / pixmap (было 300)
+OCR_IMAGE_AREA_RATIO = 0.08          # любая заметная картинка на странице → OCR
+OCR_DPI = 200                        # dpi для pdf2image / pixmap
 OCR_PDF_FORCE_FULL_IF_AVG_BELOW = 15 # средний символов/стр. → полный OCR всего PDF
+OCR_OVERLAP_SKIP = 0.75              # доля совпадения токенов OCR↔цифровой текст → пропуск дубля
 
 SUPPORTED_DOCS = {
     # документы
@@ -379,30 +380,87 @@ def _page_image_area_ratio(page) -> float:
             return 0.0
 
 
+def _normalize_for_ocr_overlap(text: str) -> str:
+    t = (text or "").lower()
+    return re.sub(r"\s+", " ", t).strip()
+
+
+def _ocr_token_set(text: str) -> set:
+    return set(re.findall(r"[а-яёa-z0-9]{3,}", _normalize_for_ocr_overlap(text), flags=re.I))
+
+
+def ocr_supplement_text(digital: str, ocr: str) -> str:
+    """
+    Возвращает OCR-текст, который дополняет цифровой слой (без дублей).
+    Если OCR почти целиком уже есть в digital — "".
+    """
+    ocr = (ocr or "").strip()
+    if not ocr:
+        return ""
+    digital = (digital or "").strip()
+    if not digital:
+        return ocr
+
+    ocr_norm = _normalize_for_ocr_overlap(ocr)
+    dig_norm = _normalize_for_ocr_overlap(digital)
+    if len(ocr_norm) >= 40 and ocr_norm in dig_norm:
+        return ""
+
+    ocr_tok = _ocr_token_set(ocr)
+    if not ocr_tok:
+        return ""
+    dig_tok = _ocr_token_set(digital)
+    overlap = len(ocr_tok & dig_tok) / len(ocr_tok)
+    if overlap >= float(globals().get("OCR_OVERLAP_SKIP", 0.75) or 0.75):
+        return ""
+    return ocr
+
+
+def pdf_page_has_visual_content(page) -> bool:
+    """
+    Есть ли на странице сканы/фото/подписи/печати/схемы/чертежи.
+    Любое встроенное изображение или заметная векторная графика → True.
+    """
+    try:
+        if page.get_images(full=True):
+            return True
+    except Exception:
+        pass
+    try:
+        if page.get_image_info(xrefs=True):
+            return True
+    except Exception:
+        pass
+    try:
+        drawings = page.get_drawings() or []
+        # таблицы/схемы/штампы часто как векторные path'ы без text layer
+        if len(drawings) >= 5:
+            return True
+    except Exception:
+        pass
+    return _page_image_area_ratio(page) >= float(
+        globals().get("OCR_IMAGE_AREA_RATIO", 0.08) or 0.08
+    )
+
+
 def page_needs_ocr(page, digital_text: str) -> bool:
     """
-    Решение: нужен ли OCR для страницы.
-    Быстрая проверка: если цифровой текст уже есть — OCR НЕ запускаем.
-    OCR только для пустых / почти пустых страниц.
+    OCR для смешанных тендерных PDF:
+    - мало цифрового текста (< OCR_MIN_CHARS_PER_PAGE), ИЛИ
+    - на странице есть изображения / графика / схемы.
+    Цифровой текст сохраняется; OCR только дополняет (см. ocr_supplement_text).
     """
     stats = _text_quality_stats(digital_text)
-    # Главный ускоритель: текст уже извлечён → пропускаем OCR
-    if stats["chars"] >= OCR_MIN_CHARS_PER_PAGE:
-        return False
-    if not (digital_text or "").strip():
+    if stats["chars"] < OCR_MIN_CHARS_PER_PAGE:
         return True
-    # Очень бедный текст + картинка на весь лист → скан
-    if (
-        stats["chars"] < OCR_MIN_CHARS_PER_PAGE
-        and _page_image_area_ratio(page) >= OCR_IMAGE_AREA_RATIO
-    ):
-        return True
-    return stats["chars"] < OCR_MIN_CHARS_PER_PAGE
+    return pdf_page_has_visual_content(page)
 
 
-def ocr_pdf_page(page, page_no: int, filename: str = "") -> str:
-    """Рендер страницы PDF → OCR."""
+def ocr_pdf_page(page, page_no: int, filename: str = "", page_count: int = 0) -> str:
+    """Рендер страницы PDF целиком → OCR (dpi=OCR_DPI, rus+eng, psm=6)."""
     try:
+        total = page_count or "?"
+        print(f"  🔍 OCR: страница {page_no} из {total} — {filename}")
         zoom = OCR_DPI / 72.0
         pix = page.get_pixmap(matrix=fitz.Matrix(zoom, zoom), alpha=False)
         img = Image.open(io.BytesIO(pix.tobytes("png")))
@@ -415,8 +473,8 @@ def ocr_pdf_page(page, page_no: int, filename: str = "") -> str:
 
 def extract_text_from_pdf(file_bytes: bytes, filename: str = "") -> str:
     """
-    PDF: цифровой текст; OCR только если текста нет / почти нет.
-    Если в PDF уже есть текст — OCR не запускается (ускорение).
+    PDF: цифровой текст + OCR страниц со сканами/изображениями/графикой.
+    OCR дополняет цифровой слой и не дублирует уже извлечённый текст.
     """
     parts: List[str] = []
     ocr_pages = 0
@@ -427,30 +485,25 @@ def extract_text_from_pdf(file_bytes: bytes, filename: str = "") -> str:
     try:
         doc = fitz.open(stream=file_bytes, filetype="pdf")
         page_count = doc.page_count
+        print(f"  📄 PDF {filename}: {page_count} стр. (цифровой текст + OCR при наличии изображений)")
         for i, page in enumerate(doc, start=1):
             digital = (page.get_text("text") or "").strip()
             digital_chars_total += len(digital)
             need_ocr = page_needs_ocr(page, digital)
 
             page_bits: List[str] = []
-            if digital and not need_ocr:
-                # Быстрый путь: текст есть → без OCR
+            if digital:
                 digital_pages += 1
                 page_bits.append(digital)
-            elif need_ocr:
-                ocr_text = ocr_pdf_page(page, i, filename)
+
+            if need_ocr:
+                ocr_text = ocr_pdf_page(page, i, filename, page_count=page_count)
                 if ocr_text:
-                    ocr_pages += 1
-                    if digital and len(digital) > 10:
-                        # гибрид только если OCR реально богаче
-                        if len(ocr_text) > len(digital) * 1.2:
-                            page_bits = [f"[OCR]\n{ocr_text}"]
-                        else:
-                            page_bits = [digital, f"[OCR-дополнение]\n{ocr_text}"]
-                    else:
-                        page_bits.append(f"[OCR]\n{ocr_text}")
-                elif digital:
-                    page_bits.append(digital)
+                    extra = ocr_supplement_text(digital, ocr_text)
+                    if extra:
+                        ocr_pages += 1
+                        label = "[OCR-дополнение]" if digital else "[OCR]"
+                        page_bits.append(f"{label}\n{extra}")
 
             if page_bits:
                 parts.append(f"[Страница {i}]\n" + "\n".join(page_bits))
@@ -462,6 +515,8 @@ def extract_text_from_pdf(file_bytes: bytes, filename: str = "") -> str:
         return ocr_pdf_bytes(file_bytes, filename)
 
     result = "\n\n".join(parts)
+    if ocr_pages:
+        print(f"  ✅ PDF {filename}: OCR дополнение на {ocr_pages}/{page_count} стр.")
 
     # Полный OCR только если почти нет цифрового текста
     avg = (digital_chars_total / page_count) if page_count else 0
@@ -475,35 +530,49 @@ def extract_text_from_pdf(file_bytes: bytes, filename: str = "") -> str:
 
 
 def extract_text_from_docx(file_bytes: bytes, filename: str = "") -> str:
-    """DOCX: текст + OCR встроенных изображений (сканы писем внутри Word)."""
+    """
+    DOCX: цифровой текст + OCR ВСЕХ встроенных изображений
+    (сканы, подписи, печати, таблицы-картинки). OCR дополняет, не дублирует.
+    """
     parts: List[str] = []
+    digital_parts: List[str] = []
     try:
         doc = Document(io.BytesIO(file_bytes))
         for para in doc.paragraphs:
             if para.text.strip():
-                parts.append(para.text)
+                digital_parts.append(para.text)
         for table in doc.tables:
             for row in table.rows:
                 cells = [c.text.strip() for c in row.cells if c.text.strip()]
                 if cells:
-                    parts.append(" | ".join(cells))
+                    digital_parts.append(" | ".join(cells))
+        parts.extend(digital_parts)
+        digital_blob = "\n".join(digital_parts)
 
-        # встроенные картинки (сканы внутри docx)
+        # встроенные картинки — всегда OCR, если есть
         try:
-            img_idx = 0
+            image_rels = []
             for rel in doc.part.rels.values():
                 try:
-                    if "image" not in getattr(rel, "reltype", ""):
-                        continue
-                    blob = rel.target_part.blob
-                    img_idx += 1
-                    ocr_text = extract_text_from_image(blob, f"{filename}#img{img_idx}")
-                    if ocr_text:
-                        parts.append(f"[Изображение {img_idx} | OCR]\n{ocr_text}")
+                    if "image" in getattr(rel, "reltype", ""):
+                        image_rels.append(rel)
                 except Exception:
                     continue
-            if img_idx:
-                print(f"  🖼️ DOCX {filename}: OCR для {img_idx} изображений")
+            total_imgs = len(image_rels)
+            if total_imgs:
+                print(f"  🖼️ DOCX {filename}: найдено изображений {total_imgs} — запускаем OCR")
+            for img_idx, rel in enumerate(image_rels, start=1):
+                try:
+                    blob = rel.target_part.blob
+                    print(f"  🔍 OCR: изображение {img_idx} из {total_imgs} — {filename}")
+                    ocr_text = extract_text_from_image(blob, f"{filename}#img{img_idx}")
+                    extra = ocr_supplement_text(digital_blob, ocr_text)
+                    if extra:
+                        parts.append(f"[Изображение {img_idx} | OCR]\n{extra}")
+                        # учитываем уже добавленный OCR при следующих картинках
+                        digital_blob = digital_blob + "\n" + extra
+                except Exception:
+                    continue
         except Exception as e:
             print(f"  ⚠️ DOCX images OCR {filename}: {e}")
     except Exception as e:
@@ -793,12 +862,14 @@ def extract_text_from_image(file_bytes: bytes, filename: str = "") -> str:
 
 
 def ocr_pdf_bytes(file_bytes: bytes, filename: str = "") -> str:
-    """Полный OCR PDF через pdf2image @ OCR_DPI + Tesseract."""
+    """Полный OCR PDF через pdf2image @ OCR_DPI + Tesseract (страница целиком)."""
     parts: List[str] = []
     try:
         images = convert_from_bytes(file_bytes, dpi=OCR_DPI)
-        print(f"  🔍 Полный OCR PDF ({len(images)} стр. @ {OCR_DPI} dpi): {filename}")
+        total = len(images)
+        print(f"  🔍 Полный OCR PDF ({total} стр. @ {OCR_DPI} dpi): {filename}")
         for i, img in enumerate(images, start=1):
+            print(f"  🔍 OCR: страница {i} из {total} — {filename}")
             text = ocr_pil_image(img, f"{filename}#p{i}")
             if text:
                 parts.append(f"[Страница {i} | OCR]\n{text}")
@@ -1568,7 +1639,8 @@ print(
     "jpg/png/zip/rar/7z + др."
 )
 print(
-    f"🔍 OCR dpi={OCR_DPI}, порог={OCR_MIN_CHARS_PER_PAGE}, "
+    f"🔍 OCR dpi={OCR_DPI}, lang={OCR_LANG}, psm=6; "
+    f"смешанный контент: OCR при изображениях/графике + цифровой текст без дублей; "
     f"chunk={CHUNK_SIZE}, TOP_K={TOP_K}, timeout={DEEPSEEK_TIMEOUT}с"
 )
 if DEEPSEEK_API_KEY:
@@ -1646,9 +1718,10 @@ from typing import Set
 
 OCR_DPI = 200
 OCR_PDF_FORCE_FULL_IF_AVG_BELOW = 15
-OCR_MIN_CHARS_PER_PAGE = 30          # как в модуле 1 (было 80)
+OCR_MIN_CHARS_PER_PAGE = 30          # мало текста → OCR
 OCR_MIN_ALPHA_RATIO = 0.25
-OCR_IMAGE_AREA_RATIO = 0.70
+OCR_IMAGE_AREA_RATIO = 0.08          # любая заметная картинка → OCR
+OCR_OVERLAP_SKIP = 0.75              # порог дубля OCR↔цифровой текст
 
 CHUNK_SIZE = 600                     # было 800
 CHUNK_OVERLAP = 100
@@ -1657,13 +1730,28 @@ TOP_K = 5                            # единый режим: TOP_K=5
 
 def page_needs_ocr(page, digital_text: str) -> bool:
     """
-    Быстрая проверка: если цифровой текст уже есть — OCR не нужен.
+    OCR при смешанном контенте: мало текста ИЛИ есть изображения/графика.
+    Цифровой слой сохраняется; OCR дополняет через ocr_supplement_text.
     """
     text = (digital_text or "").strip()
-    if len(text) >= OCR_MIN_CHARS_PER_PAGE:
-        return False
-    if not text:
+    chars = len(re.sub(r"\s+", "", text))
+    if chars < OCR_MIN_CHARS_PER_PAGE:
         return True
+    try:
+        if page.get_images(full=True):
+            return True
+    except Exception:
+        pass
+    try:
+        if page.get_image_info(xrefs=True):
+            return True
+    except Exception:
+        pass
+    try:
+        if len(page.get_drawings() or []) >= 5:
+            return True
+    except Exception:
+        pass
     try:
         rect = page.rect
         page_area = abs(rect.width * rect.height) or 1.0
@@ -1674,17 +1762,20 @@ def page_needs_ocr(page, digital_text: str) -> bool:
                 continue
             x0, y0, x1, y1 = bbox
             img_area += abs((x1 - x0) * (y1 - y0))
-        ratio = min(img_area / page_area, 1.0)
+        if (img_area / page_area) >= OCR_IMAGE_AREA_RATIO:
+            return True
     except Exception:
-        ratio = 0.0
-    return ratio >= OCR_IMAGE_AREA_RATIO and len(text) < OCR_MIN_CHARS_PER_PAGE
+        pass
+    return False
 
 
 # Пересоздаём индекс с новым размером чанка
 rag_index = RAGIndex(chunk_size=CHUNK_SIZE, chunk_overlap=CHUNK_OVERLAP)
 
 print(
-    f"⚙️ OCR: dpi={OCR_DPI}, OCR только если текст < {OCR_MIN_CHARS_PER_PAGE} симв/стр"
+    f"⚙️ OCR: dpi={OCR_DPI}, lang=rus+eng, psm=6; "
+    f"запуск при изображениях/графике или тексте < {OCR_MIN_CHARS_PER_PAGE} симв/стр "
+    f"(цифровой текст + OCR-дополнение без дублей)"
 )
 print(f"⚙️ Индекс: chunk_size={CHUNK_SIZE}, overlap={CHUNK_OVERLAP}, TOP_K={TOP_K}")
 
