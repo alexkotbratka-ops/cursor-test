@@ -1,183 +1,47 @@
 # =============================================================================
-# МОДУЛЬ 4 — Полный анализ тендера: 86 вопросов (ускоренный)
-# Выполняйте строго ПОСЛЕ модуля 3.
-# Оптимизации: TOP_K=5, DeepSeek timeout=60с, прогресс-бар с ETA.
-# Использует: rag_index, ask_deepseek, uploaded_files (модули 1–2).
+# МОДУЛЬ 4 — Анализ и отчёт (Google Colab)
+# Выполняйте ПОСЛЕ модуля 3.
+# Использует функции модуля 1: classify_document, ask_rag, clean, build_dedup…
 # =============================================================================
 
-import hashlib
-import os
-import re
 import time
+import re
 from collections import defaultdict
 from datetime import datetime
 from typing import Any, Dict, List, Optional, Sequence, Set, Tuple
+
+# --- Проверки сессии ---
+if "rag_index" not in globals() or not getattr(rag_index, "chunks", None):
+    raise RuntimeError(
+        "❌ Индекс пуст или не найден. Сначала выполните модули 1–3."
+    )
+for _fn in ("ask_rag", "classify_document", "extract_letter_requisites",
+            "clean", "build_dedup", "map_expected", "search"):
+    if _fn not in globals():
+        raise RuntimeError(
+            f"❌ Функция {_fn} не найдена. Перезапустите модуль 1."
+        )
+
+_t0_mod = time.time()
+if "_mark" in globals():
+    _mark("analysis_start")
+print("=" * 70)
+print("🚀 МОДУЛЬ 4 — Анализ тендера (86 вопросов) и отчёт")
+print("=" * 70)
 
 try:
     from google.colab import files as colab_files
 except ImportError:
     colab_files = None
-    print("⚠️ google.colab недоступен — файл сохранится локально без автоскачивания.")
-
-if "rag_index" not in globals() or rag_index is None:
-    raise RuntimeError("❌ rag_index не найден. Сначала выполните модули 1–3.")
-if not getattr(rag_index, "chunks", None):
-    raise RuntimeError("❌ Индекс пуст. Сначала выполните модуль 3.")
-if "ask_deepseek" not in globals():
-    raise RuntimeError("❌ ask_deepseek не найден. Сначала выполните модуль 1.")
-
-from sklearn.feature_extraction.text import TfidfVectorizer
-from sklearn.metrics.pairwise import cosine_similarity
-import numpy as np
 
 ANALYSIS_DATE = datetime.now()
-TOP_K = 5                            # было 12 — меньше контекста, быстрее ответ
+TOP_K = 5
 TOP_K_FORCED = 8
 MAX_CTX = 12000
-DEEPSEEK_TIMEOUT = 60                # было 120 сек.
+DEEPSEEK_TIMEOUT = int(globals().get("DEEPSEEK_TIMEOUT", 60) or 60)
 
-# --- Статус / таймер модуля 4 ---
-_T0_MODULE4 = time.time()
-_CURRENT_STATUS = "инициализация"
-
-
-def _fmt_elapsed(seconds: float) -> str:
-    if seconds != seconds or seconds < 0:
-        return "—"
-    seconds = int(round(seconds))
-    if seconds < 60:
-        return f"{seconds} сек."
-    m, s = divmod(seconds, 60)
-    if m < 60:
-        return f"{m} мин. {s} сек."
-    h, m = divmod(m, 60)
-    return f"{h} ч. {m} мин."
-
-
-def _status(msg: str) -> None:
-    """Текущий статус выполнения + сколько уже прошло."""
-    global _CURRENT_STATUS
-    _CURRENT_STATUS = msg
-    elapsed = time.time() - _T0_MODULE4
-    print(f"🔄 СТАТУС: {msg}  | ⏱ прошло {_fmt_elapsed(elapsed)}", flush=True)
-
-
-def _manual_download_link(filename: str) -> str:
-    """Путь для ручного скачивания в Colab (/content/...)."""
-    base = os.path.basename(filename)
-    if os.path.isdir("/content"):
-        # файл обычно пишется в cwd Colab = /content
-        abs_path = os.path.abspath(filename)
-        if abs_path.startswith("/content/"):
-            return abs_path
-        return f"/content/{base}"
-    return os.path.abspath(filename)
-
-
-_status("старт модуля 4 — подготовка индекса")
-
-# =============================================================================
-# Ожидаемые 14 файлов
-# =============================================================================
-
-EXPECTED_FILES = [
-    "Извещение.docx",
-    "Закупочная документация.docx",
-    "Приложение № 1 - Техническое задание.doc",
-    "Приложение № 3 - График производства работ.doc",
-    "Приложение № 4 - График освоения и финансирования денежных средств.docx",
-    "Приложение № 5 - Акт окончания работ.docx",
-    "Проект Договора СМР-ПНР по САУГПТ и ЕСУМИС.docx",
-    "Техническое задание.pdf",
-    "ВОР Раздел ПД №12 ЛСР (02-01-01) САУГПТ.xlsx",
-    "ВОР Раздел ПД №12 ЛСР (02-01-02) ЕСУМИС.xlsx",
-    "Приложение № 5 к ТЗ - ЛСР САУГПТ.xlsx",
-    "Приложение № 6 к ТЗ - ЛСР ЕСУМИС.xlsx",
-    "14-27-00987 от 03.02.2026 РД САУГПТ.pdf",
-    "14-27-03537 от 20.04.2026 РД ЕСУМИС.pdf",
-]
-
-MASK_TECH = ("рд", "14-27-", "техническое задание", "техзадани", "/тз", "тз.", "рабочая документация", "саугпт", "есумис")
-MASK_ESTIMATE = ("лср", "вор")
-MASK_CONTRACT = ("договор",)
-MASK_NOTICE = ("извещение", "закупочная")
-MASK_SCHEDULE = ("график",)
-MASK_FINANCE_SCHED = ("освоения", "финансирования")
-
-# =============================================================================
-# Дедуп индекса
-# =============================================================================
-
-def _basename(source: str) -> str:
-    name = str(source).replace("\\", "/").split("/")[-1]
-    name = re.sub(r"\s*\(\d+\)(?=\.\w+$)", "", name)
-    return name
-
-
-def _norm(name: str) -> str:
-    return re.sub(r"\s+", " ", _basename(name).lower().strip())
-
-
-def _hash(text: str) -> str:
-    return hashlib.md5(re.sub(r"\s+", " ", (text or "").strip().lower()).encode("utf-8", errors="ignore")).hexdigest()
-
-
-def _match_expected(actual: str, expected: str) -> bool:
-    a, e = _norm(actual), _norm(expected)
-    if a == e or e in a or a in e:
-        return True
-    m = re.search(r"14-27-\d+", e)
-    if m and m.group(0) in a:
-        return True
-    pairs = [
-        ("график производства", "график производства"),
-        ("график освоения", "график освоения"),
-        ("акт окончания", "акт окончания"),
-        ("закупочная документация", "закупочная документация"),
-        ("извещение", "извещение"),
-    ]
-    for pe, pa in pairs:
-        if pe in e and pa in a:
-            return True
-    if "лср" in e and "лср" in a:
-        if ("саугпт" in e and "саугпт" in a) or ("есумис" in e and "есумис" in a):
-            return True
-    if "вор" in e and "вор" in a:
-        if ("саугпт" in e and "саугпт" in a) or ("есумис" in e and "есумис" in a):
-            return True
-    if "проект договора" in e and "договор" in a and "смр" in a:
-        return True
-    if "приложение № 1" in e and "техническое задание" in a and a.endswith(".doc"):
-        return True
-    if e.startswith("техническое задание") and a.startswith("техническое задание") and a.endswith(".pdf"):
-        return True
-    return False
-
-
-def build_dedup():
-    items = list(enumerate(zip(rag_index.chunks, rag_index.sources)))
-
-    def rank(src: str):
-        s = src.lower()
-        pen = (2 if "процедуре" in s else 0) + (1 if s.count(".zip/") + s.count(".rar/") > 1 else 0)
-        return (pen, len(s))
-
-    items.sort(key=lambda it: rank(it[1][1]))
-    seen: Set[str] = set()
-    chunks, sources, orig = [], [], []
-    for i, (t, s) in items:
-        h = _hash(t)
-        if h in seen:
-            continue
-        seen.add(h)
-        chunks.append(t)
-        sources.append(s)
-        orig.append(i)
-    return chunks, sources, orig
-
-
+# --- Дедуп индекса и план файлов (функции — из модуля 1) ---
 print("🔧 Дедупликация индекса...")
-_status("дедупликация чанков индекса")
 D_CHUNKS, D_SOURCES, D_ORIG = build_dedup()
 print(f"   Чанков: {len(rag_index.chunks)} → {len(D_CHUNKS)}")
 print(f"   Уник. basename: {len({_norm(s) for s in D_SOURCES})}")
@@ -218,252 +82,8 @@ def map_expected() -> List[Tuple[str, Optional[str]]]:
 FILE_PLAN = map_expected()
 
 
-# =============================================================================
-# Классификация документов + реквизиты писем/согласований
-# =============================================================================
 
-DOC_TYPE_LETTER = "Письмо-согласование"
-DOC_TYPE_RD = "Рабочая документация"
-DOC_TYPE_ESTIMATE = "Смета"
-DOC_TYPE_TZ = "Техническое задание"
-DOC_TYPE_CONTRACT = "Договор / приложение к договору"
-DOC_TYPE_NOTICE = "Извещение / закупочная документация"
-DOC_TYPE_SCHEDULE = "График"
-DOC_TYPE_ACT = "Акт"
-DOC_TYPE_OTHER = "Прочий документ"
-DOC_TYPE_SCAN = "Скан (тип не определён)"
-
-# Явные маркеры из ТЗ + расширения для OCR/типовых формулировок
-LETTER_KW = (
-    "письмо", "согласовани", "таможн", "таможен", "фтс", "обращение",
-    "уведомлени", "разрешени", "заключаем", "не возражаем", "рассмотрев",
-)
-RD_KW = (
-    "рабочая документация", "шифр", "альбом рд", "том рд",
-    "чертеж", "спецификац", "ведомость рабочих чертежей",
-)
-EST_KW = (
-    "смета", "сметн", "лср", "вор", "локальн",
-    "единичн расцен", "итого по смете",
-)
-TZ_KW = ("техническое задание", "предмет закупки", "требования к выполнению")
-CONTRACT_KW = ("договор", "подрядчик", "заказчик обязуется", "неустойк", "гарантийный срок")
-NOTICE_KW = ("извещение", "запрос предложений", "закупочная документация", "нмцк")
-SCHEDULE_KW = ("график производства", "график освоения", "этап работ")
-ACT_KW = ("акт окончания", "акт сдачи", "приёмк")
-
-# Ключевые слова ТЗ — достаточно одного явного маркера письма
-LETTER_CORE = ("письмо", "согласовани", "таможн", "таможен", "фтс", "обращение")
-
-
-def _file_sample_text(group_key: str, max_chars: int = 12000) -> str:
-    """Собрать текст файла из чанков (начало + середина) для классификации."""
-    g = FILE_GROUPS.get(group_key)
-    if not g:
-        return ""
-    idxs = g["idxs"]
-    parts = []
-    total = 0
-    # первые чанки + равномерно ещё несколько
-    pick = list(idxs[:4])
-    if len(idxs) > 8:
-        step = max(1, len(idxs) // 6)
-        pick.extend(idxs[4::step][:6])
-    elif len(idxs) > 4:
-        pick.extend(idxs[4:8])
-    seen = set()
-    for i in pick:
-        if i in seen:
-            continue
-        seen.add(i)
-        t = D_CHUNKS[i]
-        if total + len(t) > max_chars and parts:
-            break
-        parts.append(t)
-        total += len(t)
-    return "\n".join(parts)
-
-
-def _score_keywords(text_low: str, keywords: Sequence[str]) -> int:
-    return sum(1 for kw in keywords if kw in text_low)
-
-
-def _has_rd_token(text_low: str) -> bool:
-    """«РД» как отдельный токен (не часть другого слова)."""
-    return bool(re.search(r"(?<![a-zа-я0-9])рд(?![a-zа-я0-9])", text_low))
-
-
-def classify_document(display_name: str, text: str) -> Tuple[str, List[str]]:
-    """
-    Классификация по СОДЕРЖИМОМУ (приоритетнее имени файла).
-    Возвращает (тип, список сработавших признаков).
-
-    Правила ТЗ:
-      - письмо / согласование / таможня / ФТС / обращение → Письмо-согласование
-      - рабочая документация / РД / шифр → Рабочая документация
-      - смета / ЛСР / ВОР → Смета
-    """
-    name_low = _norm(display_name)
-    text_low = (text or "").lower()
-    blob = name_low + "\n" + text_low
-    hits: List[str] = []
-
-    letter_score = _score_keywords(text_low, LETTER_KW)
-    # Контент важнее имени: «14-27-… РД …» часто письмо таможни, а не альбом РД
-    if letter_score >= 1 and any(k in text_low for k in LETTER_CORE):
-        for kw in LETTER_KW:
-            if kw in text_low:
-                hits.append(kw)
-        return DOC_TYPE_LETTER, hits[:8]
-
-    rd_score = _score_keywords(blob, RD_KW)
-    if _has_rd_token(text_low):
-        rd_score += 1
-    est_score = _score_keywords(blob, EST_KW)
-    tz_score = _score_keywords(blob, TZ_KW)
-    contract_score = _score_keywords(blob, CONTRACT_KW)
-    notice_score = _score_keywords(blob, NOTICE_KW)
-    sched_score = _score_keywords(blob, SCHEDULE_KW)
-    act_score = _score_keywords(blob, ACT_KW)
-
-    # эвристики по имени (без 14-27-… — это часто исходящий № письма)
-    if "лср" in name_low or "вор" in name_low or "смет" in name_low:
-        est_score += 3
-    if "рабочая документация" in name_low or re.search(r"(?:^|[^a-zа-я0-9])рд(?:[^a-zа-я0-9]|$)", name_low):
-        # только если нет явных маркеров письма в тексте
-        if not any(k in text_low for k in LETTER_CORE):
-            rd_score += 2
-    if "техническое задание" in name_low or (name_low.endswith(".doc") and "приложение № 1" in name_low):
-        tz_score += 2
-    if "договор" in name_low:
-        contract_score += 2
-    if "извещение" in name_low or "закупочная" in name_low:
-        notice_score += 3
-    if "график" in name_low:
-        sched_score += 3
-    if "акт" in name_low:
-        act_score += 3
-
-    ranked = [
-        (est_score, DOC_TYPE_ESTIMATE, EST_KW),
-        (rd_score, DOC_TYPE_RD, RD_KW),
-        (tz_score, DOC_TYPE_TZ, TZ_KW),
-        (contract_score, DOC_TYPE_CONTRACT, CONTRACT_KW),
-        (notice_score, DOC_TYPE_NOTICE, NOTICE_KW),
-        (sched_score, DOC_TYPE_SCHEDULE, SCHEDULE_KW),
-        (act_score, DOC_TYPE_ACT, ACT_KW),
-        (letter_score, DOC_TYPE_LETTER, LETTER_KW),
-    ]
-    ranked.sort(key=lambda x: x[0], reverse=True)
-    best_score, best_type, best_kws = ranked[0]
-    if best_score <= 0:
-        # OCR-текст есть, но тип неясен
-        if len((text or "").strip()) > 40:
-            return DOC_TYPE_SCAN, ["текст есть, ключевых маркеров нет"]
-        return DOC_TYPE_OTHER, ["пусто / мало текста"]
-
-    for kw in best_kws:
-        if kw in blob:
-            hits.append(kw)
-    if best_type == DOC_TYPE_RD and _has_rd_token(text_low) and "рд" not in hits:
-        hits.append("рд")
-    return best_type, hits[:8]
-
-
-LETTER_EXTRACT_PROMPT = """Это текст документа. Определи, является ли он письмом / согласованием / разрешением.
-Если да — извлеки реквизиты СТРОГО в формате:
-
-Тип: Письмо-согласование
-Дата письма: ...
-Номер письма: ...
-Отправитель: ...
-Получатель: ...
-Суть согласования: ...
-Результат (согласовано/отказано/с замечаниями): ...
-
-Если какого-то поля нет — напиши «Не указано».
-Если это НЕ письмо/согласование — первой строкой напиши: Тип: не письмо
-и кратко что это за документ.
-"""
-
-
-def extract_letter_requisites(display_name: str, text: str) -> Dict[str, str]:
-    """Извлечение реквизитов письма через DeepSeek (+ regex-подсказки)."""
-    result = {
-        "Тип": DOC_TYPE_LETTER,
-        "Дата письма": "Не указано",
-        "Номер письма": "Не указано",
-        "Отправитель": "Не указано",
-        "Получатель": "Не указано",
-        "Суть согласования": "Не указано",
-        "Результат": "Не указано",
-        "Файл": display_name,
-    }
-    # regex-подсказки из имени файла: «14-27-03537 от 20.04.2026 …»
-    m_num = re.search(r"(14-27-\d+)", display_name)
-    m_date = re.search(r"от\s+(\d{2}[.\-]\d{2}[.\-]\d{4})", display_name, re.I)
-    if m_num:
-        result["Номер письма"] = m_num.group(1)
-    if m_date:
-        result["Дата письма"] = m_date.group(1).replace("-", ".")
-
-    if not (text or "").strip():
-        return result
-
-    try:
-        raw = ask_deepseek(LETTER_EXTRACT_PROMPT, context=text[:14000], timeout=DEEPSEEK_TIMEOUT)
-    except Exception as e:
-        result["Суть согласования"] = f"Ошибка извлечения: {e}"
-        return result
-
-    raw = (raw or "").strip()
-    if re.search(r"тип:\s*не письмо", raw, re.I):
-        result["Тип"] = "не письмо"
-        result["Суть согласования"] = raw
-        return result
-
-    def _field(patterns: Sequence[str]) -> Optional[str]:
-        for pat in patterns:
-            m = re.search(pat, raw, flags=re.I | re.M)
-            if m:
-                val = m.group(1).strip().strip(" .;")
-                if val and val.lower() not in ("не указано", "-", "нет"):
-                    return val
-        return None
-
-    date = _field([r"Дата письма:\s*(.+)", r"Дата:\s*(.+)"])
-    number = _field([r"Номер письма:\s*(.+)", r"№\s*([^\n]+)", r"Исх\.?\s*№?\s*([^\n]+)"])
-    sender = _field([r"Отправитель:\s*(.+)", r"От кого:\s*(.+)"])
-    receiver = _field([r"Получатель:\s*(.+)", r"Кому:\s*(.+)"])
-    essence = _field([r"Суть согласования:\s*(.+)", r"Суть:\s*(.+)"])
-    outcome = _field([r"Результат[^:]*:\s*(.+)", r"Решение:\s*(.+)"])
-
-    if date:
-        result["Дата письма"] = date
-    if number:
-        result["Номер письма"] = number
-    if sender:
-        result["Отправитель"] = sender
-    if receiver:
-        result["Получатель"] = receiver
-    if essence:
-        result["Суть согласования"] = essence
-    if outcome:
-        result["Результат"] = outcome
-
-    # доп. regex по самому тексту, если LLM не нашёл
-    if result["Дата письма"] == "Не указано":
-        m = re.search(r"\b(\d{2}[.\-/]\d{2}[.\-/]\d{4})\b", text[:2000])
-        if m:
-            result["Дата письма"] = m.group(1).replace("-", ".").replace("/", ".")
-    if result["Номер письма"] == "Не указано":
-        m = re.search(r"(?:исх\.?\s*№?|№)\s*([A-Za-zА-Яа-я0-9\-_/]+)", text[:2000], re.I)
-        if m:
-            result["Номер письма"] = m.group(1)
-
-    return result
-
-
+# --- Классификация документов (функции — из модуля 1) ---
 print("🏷️ Классификация документов по содержимому...")
 _status("классификация документов и извлечение реквизитов писем")
 FILE_CLASSIFICATION: Dict[str, Dict[str, Any]] = {}  # group_key -> meta
@@ -522,140 +142,8 @@ APPROVALS = _uniq_appr
 print(f"   Найдено писем/согласований: {len(APPROVALS)}")
 
 
-# =============================================================================
-# Поиск
-# =============================================================================
 
-def _mask_hit(source: str, masks: Sequence[str]) -> bool:
-    s = source.lower().replace("\\", "/")
-    b = _norm(source)
-    return any(m.lower() in s or m.lower() in b for m in masks)
-
-
-def search(
-    query: str,
-    top_k: int = TOP_K,
-    masks: Optional[Sequence[str]] = None,
-    mask_only: bool = False,
-) -> List[Dict[str, Any]]:
-    if _MAT is None:
-        return []
-    q = _VECT.transform([query])
-    scores = cosine_similarity(q, _MAT).ravel()
-    out = []
-    for i, sc in enumerate(scores):
-        src = D_SOURCES[i]
-        matched = _mask_hit(src, masks) if masks else False
-        if mask_only and masks and not matched:
-            continue
-        boost = 0.5 if matched else 0.0
-        if not masks:
-            for kw, b in (("извещение", 0.3), ("закупочная", 0.28), ("договор", 0.28),
-                          ("лср", 0.4), ("вор", 0.4), ("график", 0.35), ("рд", 0.25),
-                          ("техническое задание", 0.3)):
-                if kw in src.lower():
-                    boost = max(boost, b)
-        sc = float(sc) + boost
-        if sc <= 0:
-            continue
-        out.append({
-            "text": D_CHUNKS[i],
-            "source": src,
-            "score": sc,
-            "chunk": D_ORIG[i] + 1,
-            "base": _basename(src),
-        })
-    out.sort(key=lambda x: x["score"], reverse=True)
-    return out[:top_k]
-
-
-def merge_hits(lists: List[List[Dict[str, Any]]], top_k: int = TOP_K) -> List[Dict[str, Any]]:
-    best: Dict[Tuple[str, str], Dict[str, Any]] = {}
-    for hits in lists:
-        for h in hits:
-            key = (h["source"], h["text"][:160])
-            if key not in best or h["score"] > best[key]["score"]:
-                best[key] = h
-    return sorted(best.values(), key=lambda x: x["score"], reverse=True)[:top_k]
-
-
-def fmt_ctx(hits: List[Dict[str, Any]], max_chars: int = MAX_CTX) -> str:
-    parts, n = [], 0
-    for i, h in enumerate(hits, 1):
-        block = f"[Фрагмент {i} | {h['source']} | чанк #{h.get('chunk')} | {h['score']:.3f}]\n{h['text']}"
-        if n + len(block) > max_chars and parts:
-            break
-        parts.append(block)
-        n += len(block)
-    return "\n\n---\n\n".join(parts)
-
-
-def _empty(text: str) -> bool:
-    t = (text or "").strip()
-    if not t:
-        return True
-    low = t.lower()
-    marks = ["не указано", "не найдено", "нет информации", "в контексте нет",
-             "информация отсутствует", "не удалось", "ответить невозможно"]
-    if len(t) < 200 and any(m in low for m in marks):
-        if re.search(r"\d{3,}", t) and ("руб" in low or "%" in t or "инн" in low):
-            return False
-        return True
-    return False
-
-
-def clean(text: str) -> str:
-    text = (text or "").strip()
-    return "Не указано" if _empty(text) else text
-
-
-PRIORITY_PROMPT = (
-    "Отвечай только по контексту. Выпиши конкретные факты: числа, даты, суммы, перечни, нормы. "
-    "Не пиши «не указано», если в контексте есть хотя бы частичный ответ. "
-    "Если данные противоречивы — укажи оба варианта и источники. Ответ на русском."
-)
-
-
-def ask_rag(
-    question: str,
-    variants: Optional[List[str]] = None,
-    masks: Optional[Sequence[str]] = None,
-    mask_only: bool = False,
-    top_k: int = TOP_K,
-) -> Tuple[str, List[Dict[str, Any]]]:
-    variants = variants or []
-    # Для скорости: основной вопрос + максимум 1 вариант (не все)
-    queries = [question] + (variants[:1] if variants else [])
-    lists = []
-    for q in queries:
-        lists.append(search(q, top_k=top_k, masks=masks, mask_only=False))
-        if masks:
-            lists.append(search(q, top_k=TOP_K_FORCED, masks=masks, mask_only=True))
-    hits = merge_hits(lists, top_k=top_k)
-    if not hits:
-        return "Не указано", []
-    ans = clean(ask_deepseek(
-        f"{PRIORITY_PROMPT}\n\nВопрос: {question}",
-        context=fmt_ctx(hits),
-        timeout=DEEPSEEK_TIMEOUT,
-    ))
-    if ans == "Не указано" and variants:
-        rq = variants[-1] + " Приведи любые найденные факты из контекста."
-        rh = merge_hits(
-            [search(rq, top_k=top_k, masks=masks, mask_only=bool(masks)), hits],
-            top_k=top_k,
-        )
-        if rh:
-            ans2 = clean(ask_deepseek(
-                f"{PRIORITY_PROMPT}\n\nВопрос: {rq}",
-                context=fmt_ctx(rh),
-                timeout=DEEPSEEK_TIMEOUT,
-            ))
-            if ans2 != "Не указано":
-                return ans2, rh
-    return ans, hits
-
-
+# --- 86 вопросов ---
 # =============================================================================
 # 86 вопросов: (id, section, title, question, variants, masks, mask_only, kind)
 # kind: rag | meta | synthesize
@@ -920,36 +408,21 @@ Q(86, "7. СТАТИСТИКА И ПОЛНОТА АНАЛИЗА", "Общий в
 assert len(QUESTIONS) == 86, f"Ожидалось 86 вопросов, получено {len(QUESTIONS)}"
 
 
-# =============================================================================
-# Номер тендера
-# =============================================================================
-
-TENDER_RE = re.compile(r"(B\d{10,})", re.IGNORECASE)
-
-
-def find_tender_no() -> str:
-    names = []
-    if "uploaded_files" in globals() and uploaded_files:
-        names.extend(uploaded_files.keys())
-    names.extend(D_SOURCES)
-    for n in names:
-        m = TENDER_RE.search(str(n))
-        if m:
-            return m.group(1).upper()
-    return ""
-
 
 # =============================================================================
-# Запуск
+# Запуск анализа (find_tender_no / _progress_bar — из модуля 1)
 # =============================================================================
 
-print("🚀 Модуль 4: 86 вопросов по всем файлам тендера (ускоренный режим)")
+print("🚀 Анализ: 86 вопросов по всем файлам тендера (ускоренный режим)")
 print(f"   Уник. файлов: {len(FILE_GROUPS)}")
 print(f"   Чанков после дедупа: {len(D_CHUNKS)}")
 print(f"   Вопросов: {len(QUESTIONS)}")
 print(f"   TOP_K={TOP_K}, DeepSeek timeout={DEEPSEEK_TIMEOUT}с")
 print()
-_status("анализ 86 вопросов (RAG + синтез)")
+if "_status" in globals():
+    _status("модуль 4 — ответы на 86 вопросов")
+
+_t0_analysis = time.time()
 
 tender_no = find_tender_no()
 if tender_no:
@@ -961,31 +434,6 @@ files_touched: Set[str] = set()
 per_file_hits: Dict[str, int] = defaultdict(int)
 
 TOTAL = 86
-
-
-def _fmt_eta(seconds: float) -> str:
-    return _fmt_elapsed(seconds)
-
-
-def _progress_bar(done: int, total: int, t0: float, title: str = "") -> str:
-    total = max(1, total)
-    pct = 100.0 * done / total
-    width = 12
-    filled = min(width, max(0, int(round(width * done / total))))
-    bar = "█" * filled + "░" * (width - filled)
-    elapsed = time.time() - t0
-    if done > 0:
-        eta_s = _fmt_eta(elapsed * (total - done) / done)
-    else:
-        eta_s = "оценка…"
-    short = (title[:36] + "…") if len(title) > 37 else title
-    passed = _fmt_elapsed(time.time() - _T0_MODULE4)
-    return (
-        f"🔄 СТАТУС: вопрос {min(done + 1, total)}/{total} — {short}  | "
-        f"[{bar}] {pct:.0f}% (осталось {eta_s}, прошло {passed})"
-    )
-
-_t0_analysis = time.time()
 
 for q in QUESTIONS:
     n = q["num"]
@@ -1133,10 +581,9 @@ for q in QUESTIONS:
 print(_progress_bar(TOTAL, TOTAL, _t0_analysis, "анализ завершён"), flush=True)
 print(f"⏱️ Полный анализ: {_fmt_eta(time.time() - _t0_analysis)}")
 
-# =============================================================================
-# Отчёт
-# =============================================================================
 
+
+# --- Отчёт ---
 def build_name(num: str) -> str:
     d = ANALYSIS_DATE.strftime("%Y%m%d")
     t = ANALYSIS_DATE.strftime("%H%M%S")
@@ -1225,7 +672,24 @@ def format_report() -> str:
 
 _status("формирование TXT-отчёта")
 
+_mark("analysis_end")
+# end отметим после скачивания — чтобы итог включал запись/download
+_t_deps = _elapsed("deps_start", "deps_end")
+_t_up = _elapsed("upload_start", "upload_end")
+_t_idx = _elapsed("index_start", "index_end")
+_t_an = _elapsed("analysis_start", "analysis_end")
+
 report_text = format_report()
+report_text = report_text.rstrip() + (
+    f"\n\n{'=' * 70}\n"
+    f"СВОДКА ВРЕМЕНИ ВЫПОЛНЕНИЯ\n"
+    f"{'=' * 70}\n"
+    f"1. Зависимости / init:   {_fmt_dur(_t_deps)}\n"
+    f"2. Загрузка файлов:      {_fmt_dur(_t_up)}\n"
+    f"3. OCR / индексация:     {_fmt_dur(_t_idx)}\n"
+    f"4. Анализ 86 вопросов:   {_fmt_dur(_t_an)}\n"
+)
+
 report_filename = build_name(tender_no)
 with open(report_filename, "w", encoding="utf-8") as f:
     f.write(report_text)
@@ -1237,11 +701,27 @@ tender_answers = answers
 tender_file_status = file_status_rows
 
 _manual_link = _manual_download_link(report_filename)
-_elapsed_total = time.time() - _T0_MODULE4
 
 _status("скачивание отчёта")
 if colab_files is not None:
     colab_files.download(report_filename)
+
+_mark("end")
+_t_all = _elapsed("start", "end")
+tender_timings = {
+    "deps": _t_deps,
+    "upload": _t_up,
+    "index": _t_idx,
+    "analysis": _t_an,
+    "total": _t_all,
+}
+
+# допишем ИТОГО в файл
+try:
+    with open(report_filename, "a", encoding="utf-8") as f:
+        f.write(f"ИТОГО:                   {_fmt_dur(_t_all)}\n")
+except Exception:
+    pass
 
 print()
 print("✅ Отчёт сформирован!")
@@ -1256,11 +736,17 @@ print(f"\n📥 Файл скачан автоматически." if colab_files
 print(f"📁 Если скачивание не началось, скачайте вручную:")
 print(f"   🔗 {_manual_link}")
 
+
+
+# --- Сводка по времени модуля 4 ---
+_elapsed = time.time() - _t0_mod
 print()
 print("=" * 70)
-print("⏱ ВРЕМЯ ВЫПОЛНЕНИЯ")
+print("Сводка модуля 4")
 print("=" * 70)
-print(f"   Итого прошло: {_fmt_elapsed(_elapsed_total)}")
-print(f"   Финальный статус: отчёт готов")
+if "_fmt_dur" in globals():
+    print(f"   Анализ + отчёт: {_fmt_dur(_elapsed)}")
+else:
+    print(f"   Анализ + отчёт: {int(_elapsed)} сек.")
 print()
-_status("модуль 4 завершён")
+print("✅ Отчёт сформирован!")

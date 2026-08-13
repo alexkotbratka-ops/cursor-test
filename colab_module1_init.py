@@ -1,8 +1,78 @@
 # =============================================================================
-# МОДУЛЬ 1 — Запуск системы анализа документов (Google Colab)
-# Поддержка форматов, типичных для тендерной документации.
-# Скопируйте ВЕСЬ код ниже в одну ячейку Colab и выполните.
+# МОДУЛЬ 1 — Инициализация и установка (Google Colab)
+# Выполните ПЕРВЫМ. Затем: модуль 2 → 3 → 4.
+#
+# Содержит ВСЕ функции эталона (модуль 5): OCR, извлечение, архивы,
+# RAGIndex, ask_deepseek, ask_rag, classify_document и др.
+# Эталон логики OCR/извлечения — colab_module5_full.py (не менять).
 # =============================================================================
+
+import time as _time_boot
+
+_TIMINGS = {}
+_T0_ALL = _time_boot.time()
+
+
+def _mark(name: str):
+    _TIMINGS[name] = _time_boot.time()
+
+
+def _fmt_dur(seconds: float) -> str:
+    seconds = max(0, int(round(seconds)))
+    if seconds < 60:
+        return f"{seconds} сек."
+    m, s = divmod(seconds, 60)
+    if m < 60:
+        return f"{m} мин. {s} сек."
+    h, m = divmod(m, 60)
+    return f"{h} ч. {m} мин."
+
+
+def _elapsed(name_from: str, name_to: str = None) -> float:
+    a = _TIMINGS.get(name_from, _T0_ALL)
+    b = _TIMINGS.get(name_to, _time_boot.time()) if name_to else _time_boot.time()
+    return b - a
+
+
+_CURRENT_STATUS = "инициализация"
+
+
+def _status(msg: str) -> None:
+    """Текущий статус выполнения + сколько уже прошло с старта модуля 5."""
+    global _CURRENT_STATUS
+    _CURRENT_STATUS = msg
+    print(
+        f"🔄 СТАТУС: {msg}  | ⏱ прошло {_fmt_dur(_elapsed('start'))}",
+        flush=True,
+    )
+
+
+def _manual_download_link(filename: str) -> str:
+    base = os.path.basename(filename) if "os" in dir() else filename
+    try:
+        import os as _os
+        base = _os.path.basename(filename)
+        if _os.path.isdir("/content"):
+            abs_path = _os.path.abspath(filename)
+            if abs_path.startswith("/content/"):
+                return abs_path
+            return f"/content/{base}"
+        return _os.path.abspath(filename)
+    except Exception:
+        return f"/content/{filename}"
+
+
+_mark("start")
+_mark("deps_start")
+_status("модуль 1 — установка зависимостей и инициализация")
+
+# =============================================================================
+# ЭТАП 1/5 — Установка зависимостей и инициализация
+# =============================================================================
+print("=" * 70)
+print("🚀 МОДУЛЬ 1 — Инициализация и установка")
+print("Установка зависимостей, импорты, API-ключ, функции")
+print("=" * 70)
 
 # --- 1. Установка системных пакетов и Python-библиотек ---
 import subprocess
@@ -69,6 +139,7 @@ subprocess.check_call(
 )
 print("✅ Зависимости установлены.\n")
 
+
 # --- 2. Импорты ---
 import csv
 import gzip
@@ -83,7 +154,7 @@ import zipfile
 import xml.etree.ElementTree as ET
 from getpass import getpass
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Sequence, Set, Tuple
 
 import fitz  # pymupdf
 import numpy as np
@@ -140,20 +211,20 @@ os.environ["DEEPSEEK_API_KEY"] = DEEPSEEK_API_KEY
 DEEPSEEK_API_URL = "https://api.deepseek.com/chat/completions"
 DEEPSEEK_MODEL = "deepseek-chat"
 
+# --- Настройки RAG / OCR (ключевые константы) ---
 CHUNK_SIZE = 600
 CHUNK_OVERLAP = 100
 TOP_K = 5
-OCR_LANG = "rus+eng"
-DEEPSEEK_TIMEOUT = 60                # сек. на ответ API (было 120)
+OCR_LANG = "rus+eng"                 # русский + английский
+DEEPSEEK_TIMEOUT = 60                # сек. на ответ API
 
-# Пороги детекции сканов / смешанного контента
-# OCR запускается при малом тексте ИЛИ при наличии изображений/графики на странице.
+# Пороги OCR для смешанных тендерных документов (текст + сканы)
 OCR_MIN_CHARS_PER_PAGE = 30          # мало текста → страница почти наверняка скан
 OCR_MIN_ALPHA_RATIO = 0.35           # доля букв среди непробельных символов
 OCR_IMAGE_AREA_RATIO = 0.08          # любая заметная картинка на странице → OCR
-OCR_DPI = 200                        # dpi для pdf2image / pixmap
-OCR_OVERLAP_SKIP = 0.75              # доля совпадения токенов OCR↔цифровой текст → пропуск дубля
-ARCHIVE_MAX_DEPTH = 4                 # макс. глубина вложенных архивов
+OCR_DPI = 200                        # dpi рендера PDF для OCR
+OCR_PDF_FORCE_FULL_IF_AVG_BELOW = 15 # средний символов/стр. → полный OCR всего PDF
+OCR_OVERLAP_SKIP = 0.75              # совпадение токенов OCR↔цифровой текст → пропуск дубля
 
 SUPPORTED_DOCS = {
     # документы
@@ -219,7 +290,7 @@ def file_ext(filename: str) -> str:
 
 
 # =============================================================================
-# OCR helpers — полное распознавание сканов и изображений
+# OCR helpers — смешанный контент: цифровой текст + сканы/печати/схемы
 # =============================================================================
 
 def _preprocess_for_ocr(img: Image.Image) -> Image.Image:
@@ -243,9 +314,11 @@ def ocr_pil_image(img: Image.Image, filename: str = "") -> str:
     """OCR PIL-изображения: один основной проход psm=6 (без тройного PSM)."""
     try:
         processed = _preprocess_for_ocr(img)
+        # Режим «страница целиком» — один раз (не гоняем psm 4/3 дополнительно)
         text = pytesseract.image_to_string(
             processed, lang=OCR_LANG, config="--oem 3 --psm 6"
         ).strip()
+        # Запасной проход только если почти пусто
         if len(text) < 20:
             try:
                 raw = img.convert("RGB") if img.mode != "RGB" else img
@@ -285,6 +358,7 @@ def _page_image_area_ratio(page) -> float:
             img_area += abs((x1 - x0) * (y1 - y0))
         return min(img_area / page_area, 1.0)
     except Exception:
+        # fallback: есть ли картинки вообще
         try:
             return 0.8 if page.get_images(full=True) else 0.0
         except Exception:
@@ -301,17 +375,22 @@ def _ocr_token_set(text: str) -> set:
 
 
 def ocr_supplement_text(digital: str, ocr: str) -> str:
-    """OCR-текст, дополняющий цифровой слой (без дублей)."""
+    """
+    Возвращает OCR-текст, который дополняет цифровой слой (без дублей).
+    Если OCR почти целиком уже есть в digital — "".
+    """
     ocr = (ocr or "").strip()
     if not ocr:
         return ""
     digital = (digital or "").strip()
     if not digital:
         return ocr
+
     ocr_norm = _normalize_for_ocr_overlap(ocr)
     dig_norm = _normalize_for_ocr_overlap(digital)
     if len(ocr_norm) >= 40 and ocr_norm in dig_norm:
         return ""
+
     ocr_tok = _ocr_token_set(ocr)
     if not ocr_tok:
         return ""
@@ -323,7 +402,10 @@ def ocr_supplement_text(digital: str, ocr: str) -> str:
 
 
 def pdf_page_has_visual_content(page) -> bool:
-    """Есть ли на странице сканы/фото/подписи/печати/схемы/чертежи."""
+    """
+    Есть ли на странице сканы/фото/подписи/печати/схемы/чертежи.
+    Любое встроенное изображение или заметная векторная графика → True.
+    """
     try:
         if page.get_images(full=True):
             return True
@@ -335,7 +417,9 @@ def pdf_page_has_visual_content(page) -> bool:
     except Exception:
         pass
     try:
-        if len(page.get_drawings() or []) >= 5:
+        drawings = page.get_drawings() or []
+        # таблицы/схемы/штампы часто как векторные path'ы без text layer
+        if len(drawings) >= 5:
             return True
     except Exception:
         pass
@@ -346,8 +430,10 @@ def pdf_page_has_visual_content(page) -> bool:
 
 def page_needs_ocr(page, digital_text: str) -> bool:
     """
-    OCR при смешанном контенте: мало текста ИЛИ есть изображения/графика.
-    Цифровой текст сохраняется; OCR дополняет.
+    OCR для смешанных тендерных PDF:
+    - мало цифрового текста (< OCR_MIN_CHARS_PER_PAGE), ИЛИ
+    - на странице есть изображения / графика / схемы.
+    Цифровой текст сохраняется; OCR только дополняет (см. ocr_supplement_text).
     """
     stats = _text_quality_stats(digital_text)
     if stats["chars"] < OCR_MIN_CHARS_PER_PAGE:
@@ -589,8 +675,8 @@ def extract_text_from_pdf(file_bytes: bytes, filename: str = "") -> str:
 
 def extract_text_from_docx(file_bytes: bytes, filename: str = "") -> str:
     """
-    DOCX: цифровой текст + OCR ВСЕХ встроенных изображений.
-    OCR дополняет, не дублирует.
+    DOCX: цифровой текст + OCR ВСЕХ встроенных изображений
+    (сканы, подписи, печати, таблицы-картинки). OCR дополняет, не дублирует.
     """
     parts: List[str] = []
     digital_parts: List[str] = []
@@ -607,6 +693,7 @@ def extract_text_from_docx(file_bytes: bytes, filename: str = "") -> str:
         parts.extend(digital_parts)
         digital_blob = "\n".join(digital_parts)
 
+        # встроенные картинки — всегда OCR, если есть
         try:
             image_rels = []
             for rel in doc.part.rels.values():
@@ -626,6 +713,7 @@ def extract_text_from_docx(file_bytes: bytes, filename: str = "") -> str:
                     extra = ocr_supplement_text(digital_blob, ocr_text)
                     if extra:
                         parts.append(f"[Изображение {img_idx} | OCR]\n{extra}")
+                        # учитываем уже добавленный OCR при следующих картинках
                         digital_blob = digital_blob + "\n" + extra
                 except Exception:
                     continue
@@ -918,14 +1006,23 @@ def extract_text_from_image(file_bytes: bytes, filename: str = "") -> str:
 
 
 def ocr_pdf_bytes(file_bytes: bytes, filename: str = "") -> str:
-    """Полный OCR PDF через pdf2image @ OCR_DPI + Tesseract (страница целиком)."""
+    """Полный OCR PDF — один проход. Повтор блокируется через _PDF_OCR_STATUS."""
+    import hashlib as _hashlib
+
+    cache_key = _hashlib.md5(file_bytes).hexdigest()
+    # Если статус уже True и есть кэш — не гоняем Tesseract снова
+    cached = _pdf_cache_get(cache_key)
+    if cached is not None and _pdf_ocr_already_done(cache_key):
+        print(f"  ⏭️ Повторный OCR заблокирован для {filename} (ocr_pdf_bytes)", flush=True)
+        return cached
+
     parts: List[str] = []
     try:
         images = convert_from_bytes(file_bytes, dpi=OCR_DPI)
         total = len(images)
-        print(f"  🔍 Полный OCR PDF ({total} стр. @ {OCR_DPI} dpi): {filename}")
+        print(f"  🔍 Полный OCR PDF ({total} стр. @ {OCR_DPI} dpi): {filename}", flush=True)
         for i, img in enumerate(images, start=1):
-            print(f"  🔍 OCR: страница {i} из {total} — {filename}")
+            print(f"  🔍 OCR: страница {i} из {total} — {filename}", flush=True)
             text = ocr_pil_image(img, f"{filename}#p{i}")
             if text:
                 parts.append(f"[Страница {i} | OCR]\n{text}")
@@ -1298,58 +1395,16 @@ def extract_text_from_dwg(file_bytes: bytes, filename: str = "") -> str:
 # Распаковка архивов (рекурсивно)
 # =============================================================================
 
-def _fix_zip_member_name(name: str, info: "zipfile.ZipInfo") -> str:
-    """
-    Имена в ZIP с Windows (часто CP866) без UTF-8 флага приходят как mojibake.
-    Пробуем восстановить кириллицу.
-    """
-    name = name.replace("\\", "/")
-    # Бит 11 = UTF-8
-    if info.flag_bits & 0x800:
-        return name
-    try:
-        raw = name.encode("cp437", errors="strict")
-    except Exception:
-        return name
-    for enc in ("cp866", "cp1251", "utf-8"):
-        try:
-            decoded = raw.decode(enc)
-            # предпочитаем вариант с кириллицей / читаемыми символами
-            if any("а" <= ch.lower() <= "я" or ch in "ёЁ" for ch in decoded):
-                return decoded
-            if enc == "utf-8":
-                return decoded
-        except Exception:
-            continue
-    return name
-
-
 def _iter_archive_members_zip(file_bytes: bytes) -> List[Tuple[str, bytes]]:
-    """Распаковка ZIP с поддержкой кириллических имён (CP866/CP1251)."""
     members: List[Tuple[str, bytes]] = []
-    try:
-        zf = zipfile.ZipFile(io.BytesIO(file_bytes))
-    except Exception as e:
-        print(f"  ❌ ZIP не открылся: {e}")
-        return members
-
-    with zf:
-        infos = zf.infolist()
-        print(f"  📦 ZIP: записей в архиве = {len(infos)}")
-        for info in infos:
-            name = _fix_zip_member_name(info.filename, info)
-            if name.endswith("/") or info.is_dir():
-                print(f"     · (папка) {name}")
-                continue
-            if "__MACOSX" in name or Path(name).name.startswith("."):
+    with zipfile.ZipFile(io.BytesIO(file_bytes)) as zf:
+        for name in zf.namelist():
+            if name.endswith("/") or "__MACOSX" in name or Path(name).name.startswith("."):
                 continue
             try:
-                data = zf.read(info)
-                members.append((name, data))
-                print(f"     · {name} [{len(data):,} байт]")
+                members.append((name, zf.read(name)))
             except Exception as e:
                 print(f"  ⚠️ Не удалось прочитать из ZIP: {name}: {e}")
-    print(f"  📦 ZIP: извлечено файлов = {len(members)}")
     return members
 
 
@@ -1452,28 +1507,17 @@ def unpack_archive(file_bytes: bytes, filename: str) -> List[Tuple[str, bytes]]:
     return []
 
 
-def extract_documents_from_bytes(
-    file_bytes: bytes,
-    filename: str,
-    depth: int = 0,
-) -> List[Tuple[str, str]]:
+def extract_documents_from_bytes(file_bytes: bytes, filename: str) -> List[Tuple[str, str]]:
     """
     Извлекает документы из файла или архива (рекурсивно).
-    depth — уровень вложенности архива (0 = исходный файл).
-    ARCHIVE_MAX_DEPTH ограничивает распаковку (по умолчанию 4).
+    Возвращает список (источник, текст).
     """
-    max_depth = int(globals().get("ARCHIVE_MAX_DEPTH", 4) or 4)
     ext = file_ext(filename)
     results: List[Tuple[str, str]] = []
 
     if ext in SUPPORTED_ARCHIVES:
-        if depth >= max_depth:
-            print(f"  ⏭️ Архив глубже {max_depth} ур. — пропуск: {filename}")
-            return results
         for inner_name, data in unpack_archive(file_bytes, filename):
-            nested = extract_documents_from_bytes(
-                data, f"{filename}/{inner_name}", depth=depth + 1
-            )
+            nested = extract_documents_from_bytes(data, f"{filename}/{inner_name}")
             results.extend(nested)
         return results
 
@@ -1591,11 +1635,7 @@ class RAGIndex:
         self.matrix = None
 
 
-# Глобальное хранилище сессии:
-#   uploaded_files — модуль 2 положит сюда {имя: bytes}
-#   rag_index      — модуль 3 построит индекс после чтения
-uploaded_files = {}
-rag_index = RAGIndex()
+# Глобальные uploaded_files / rag_index инициализируются в конце модуля 1.
 
 
 # =============================================================================
@@ -1743,24 +1783,886 @@ def ask_with_rag(question: str, top_k: int = TOP_K) -> Dict[str, Any]:
     return {"answer": answer, "sources": hits}
 
 
-# --- Готово ---
 print(
-    "📎 Поддерживаемые форматы: "
-    "docx/doc/rtf/odt/pdf(+OCR сканов)/txt/log/md/html/xml/json, "
-    "eml/msg (+вложения OCR), "
-    "xlsx/xls/csv/ods, "
-    "jpg/png/bmp/gif/tif/webp (полный OCR), "
-    "zip/rar/7z/tar/gz, "
-    "dwg/dxf, ppt/pptx + fallback OCR для бинарных/без расширения."
+    "📎 Форматы: docx/doc/rtf/odt/pdf(+OCR)/txt/eml/msg/xlsx/xls/csv/ods/"
+    "jpg/png/zip/rar/7z + др."
 )
 print(
-    f"🔍 OCR: dpi={OCR_DPI}, lang={OCR_LANG}, psm=6; "
-    f"смешанный контент (изображения/графика → OCR + цифровой текст без дублей); "
-    f"timeout DeepSeek={DEEPSEEK_TIMEOUT}с, chunk={CHUNK_SIZE}"
+    f"🔍 OCR dpi={OCR_DPI}, lang={OCR_LANG}, psm=6; "
+    f"смешанный контент: OCR при изображениях/графике + цифровой текст без дублей; "
+    f"chunk={CHUNK_SIZE}, TOP_K={TOP_K}, timeout={DEEPSEEK_TIMEOUT}с"
 )
 if DEEPSEEK_API_KEY:
-    print("🔐 API-ключ DeepSeek сохранён в сессии.")
+    print("🔐 API-ключ DeepSeek сохранён.")
 else:
-    print("⚠️ API-ключ пустой — ask_deepseek потребует ключ позже.")
+    print("⚠️ API-ключ пустой — ответы DeepSeek будут недоступны.")
 
+
+
+# =============================================================================
+# Утилиты индексации (используются модулем 3)
+# =============================================================================
+
+import hashlib
+import threading
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from typing import Set
+
+_PRINT_LOCK = threading.Lock()
+
+
+def _log(*args, **kwargs):
+    with _PRINT_LOCK:
+        print(*args, **kwargs)
+
+
+def _progress_line(done: int, total: int, t0: float, label: str = "") -> str:
+    total = max(1, total)
+    pct = 100.0 * done / total
+    width = 12
+    filled = min(width, max(0, int(round(width * done / total))))
+    bar = "█" * filled + "░" * (width - filled)
+    elapsed = time.time() - t0
+    if done > 0:
+        eta = elapsed * (total - done) / done
+        if eta < 60:
+            eta_s = f"{int(round(eta))} сек."
+        else:
+            eta_s = f"{int(round(eta / 60))} мин."
+    else:
+        eta_s = "оценка…"
+    prefix = f"{label} " if label else ""
+    return f"{prefix}[{bar}] {pct:.0f}% ({eta_s} осталось)"
+
+
+def _fmt_size(n: int) -> str:
+    if n >= 1024 * 1024:
+        return f"{n / (1024 * 1024):.2f} MB ({n:,} байт)"
+    if n >= 1024:
+        return f"{n / 1024:.2f} KB ({n:,} байт)"
+    return f"{n} байт"
+
+
+def _safe_ext(filename: str) -> str:
+    if "file_ext" in globals():
+        normalized = str(filename).replace("\\", "/")
+        ext = file_ext(normalized)
+        if ext:
+            return ext
+    name = str(filename).replace("\\", "/").split("/")[-1].lower().strip()
+    if name.endswith(".tar.gz"):
+        return ".tar.gz"
+    if name.endswith(".tar.bz2"):
+        return ".tar.bz2"
+    if "." not in name:
+        return ""
+    return "." + name.rsplit(".", 1)[-1]
+
+
+def _basename(filename: str) -> str:
+    return str(filename).replace("\\", "/").split("/")[-1]
+
+
+def _canon_basename(filename: str) -> str:
+    """file (2).docx → file.docx (для дедупа копий Colab)."""
+    name = _basename(filename)
+    name = re.sub(r"\s*\(\d+\)(?=\.\w+$)", "", name)
+    return name.lower().strip()
+
+
+def _md5(data: bytes) -> str:
+    return hashlib.md5(data).hexdigest()
+
+
+# =============================================================================
+# 2) Дедупликация загруженных файлов
+# =============================================================================
+
+def dedupe_uploaded(files: Dict[str, bytes]) -> Dict[str, bytes]:
+    """
+    Убирает дубликаты по MD5 содержимого и по каноническому имени.
+    Печатает: ⏭️ Пропуск дубликата: ...
+    """
+    unique: Dict[str, bytes] = {}
+    seen_hash: Set[str] = set()
+    seen_name: Set[str] = set()
+    skipped = 0
+
+    # стабильный порядок
+    for name, data in files.items():
+        h = _md5(data)
+        cname = _canon_basename(name)
+
+        if h in seen_hash:
+            _log(f"⏭️ Пропуск дубликата: {name} (уже обработан, тот же хэш)")
+            skipped += 1
+            continue
+        if cname in seen_name:
+            _log(f"⏭️ Пропуск дубликата: {name} (уже обработан как «{cname}»)")
+            skipped += 1
+            continue
+
+        seen_hash.add(h)
+        seen_name.add(cname)
+        unique[name] = data
+
+    _log(f"🧹 Дедупликация: было {len(files)} → уникальных {len(unique)} (пропущено {skipped})")
+    return unique
+
+
+# Глобальные множества для дедупа внутри архивов (на весь прогон модуля 3)
+_SEEN_INNER_HASHES: Set[str] = set()
+_SEEN_INNER_NAMES: Set[str] = set()
+_DEDUP_LOCK = threading.Lock()
+
+
+def _register_or_skip_inner(name: str, data: bytes) -> bool:
+    """
+    Дедуп ТОЛЬКО для файлов внутри архивов.
+    True = это дубликат, пропустить.
+    False = новый файл, зарегистрирован.
+    Не использовать для загрузок верхнего уровня (их чистит dedupe_uploaded).
+    """
+    h = _md5(data)
+    cname = _canon_basename(name)
+    with _DEDUP_LOCK:
+        if h in _SEEN_INNER_HASHES:
+            return True
+        if cname in _SEEN_INNER_NAMES:
+            return True
+        _SEEN_INNER_HASHES.add(h)
+        _SEEN_INNER_NAMES.add(cname)
+        return False
+
+
+# =============================================================================
+# Извлечение текста
+# =============================================================================
+
+def _read_document_bytes(file_bytes: bytes, filename: str) -> str:
+    ext = _safe_ext(filename)
+    clean_name = _basename(filename) or f"document{ext}"
+
+    if ext == ".doc":
+        text = ""
+        if "extract_text_from_doc" in globals():
+            try:
+                text = extract_text_from_doc(file_bytes, clean_name) or ""
+            except Exception as e:
+                _log(f"  ⚠️ extract_text_from_doc({clean_name}): {e}")
+        if not (text or "").strip() and "extract_text" in globals():
+            try:
+                text = extract_text(file_bytes, clean_name) or ""
+            except Exception as e:
+                _log(f"  ⚠️ extract_text({clean_name}): {e}")
+        return (text or "").strip()
+
+    if "extract_text" in globals():
+        try:
+            return (extract_text(file_bytes, clean_name) or "").strip()
+        except Exception as e:
+            _log(f"  ⚠️ extract_text({clean_name}): {e}")
+            return ""
+    return ""
+
+
+def _status_label(ext: str, ok: bool) -> str:
+    if ok:
+        if ext == ".doc":
+            return "прочитан (.doc / antiword)"
+        if "SUPPORTED_DOCS" in globals() and ext in SUPPORTED_DOCS:
+            return "прочитан"
+        return "прочитан (fallback)"
+    if ext == ".doc":
+        return "пропущен (.doc: antiword не извлёк текст)"
+    return "пропущен (пустой текст / не удалось прочитать)"
+
+
+def _extract_from_any(file_bytes: bytes, filename: str) -> List[Tuple[str, str]]:
+    """Рекурсивно извлекает документы; дубликаты внутри архивов пропускает."""
+    ext = _safe_ext(filename)
+    results: List[Tuple[str, str]] = []
+
+    if ext in SUPPORTED_ARCHIVES:
+        try:
+            members = unpack_archive(file_bytes, filename)
+        except Exception as e:
+            _log(f"  ❌ Ошибка распаковки {filename}: {e}")
+            return results
+        for inner_name, data in members:
+            inner_norm = str(inner_name).replace("\\", "/")
+            full = f"{filename}/{inner_norm}"
+            if _register_or_skip_inner(inner_norm, data):
+                _log(f"  ⏭️ Пропуск дубликата: {inner_norm} (уже обработан)")
+                continue
+            results.extend(_extract_from_any(data, full))
+        return results
+
+    # обычный файл (уже прошёл дедуп на уровне архива, либо это вложенный вызов)
+    text = _read_document_bytes(file_bytes, filename)
+    if text:
+        results.append((filename, text))
+    return results
+
+
+def _process_uploaded_file(filename: str, file_bytes: bytes) -> List[Tuple[str, str]]:
+    """Читает один загруженный файл/архив. Сначала листинг архива, потом OCR."""
+    ext = _safe_ext(filename)
+    size = len(file_bytes)
+    extracted: List[Tuple[str, str]] = []
+
+    lines = [
+        "=" * 80,
+        f"📄 Файл: {filename}",
+        f"   Размер: {_fmt_size(size)}",
+        f"   Тип: {'архив ' + ext if ext in SUPPORTED_ARCHIVES else ext or '(без расширения)'}",
+    ]
+
+    if ext in SUPPORTED_ARCHIVES:
+        lines.append("   Содержимое архива:")
+        try:
+            members = unpack_archive(file_bytes, filename)
+        except Exception as e:
+            lines.append(f"   ❌ Не удалось открыть архив: {e}")
+            members = []
+
+        if not members:
+            lines.append("   ⚠️ Архив пуст или не удалось прочитать.")
+            _log("\n".join(lines))
+            return extracted
+
+        # 1) Полный листинг БЕЗ OCR (чтобы OCR не шёл «во время распаковки»)
+        work_items: List[Tuple[str, bytes, str]] = []
+        for inner_name, data in members:
+            inner_norm = str(inner_name).replace("\\", "/")
+            inner_ext = _safe_ext(inner_norm)
+            prefix = f"   • {inner_norm} [{_fmt_size(len(data))}]"
+            source = f"{filename}/{inner_norm}"
+
+            if _register_or_skip_inner(inner_norm, data):
+                lines.append(f"{prefix} → ⏭️ Пропуск дубликата: {inner_norm} (уже обработан)")
+                continue
+
+            if inner_ext in SUPPORTED_ARCHIVES:
+                lines.append(f"{prefix} → вложенный архив (после листинга)")
+            else:
+                lines.append(f"{prefix} → в очереди на чтение/OCR")
+            work_items.append((inner_norm, data, source))
+
+        lines.append(f"   Распаковка завершена: к обработке {len(work_items)} файл(ов)")
+        _log("\n".join(lines))
+
+        # 2) Только после листинга — извлечение текста / OCR
+        for inner_norm, data, source in work_items:
+            inner_ext = _safe_ext(inner_norm)
+            if inner_ext in SUPPORTED_ARCHIVES:
+                nested = _extract_from_any(data, source)
+                extracted.extend(nested)
+                if nested:
+                    chars = sum(len(t) for _, t in nested)
+                    _log(
+                        f"   ✅ {inner_norm}: вложенный архив → {len(nested)} док., {chars:,} символов"
+                    )
+                else:
+                    _log(f"   ⚠️ {inner_norm}: вложенный архив пуст / только дубли")
+                continue
+
+            text = _read_document_bytes(data, inner_norm)
+            if text:
+                extracted.append((source, text))
+                _log(
+                    f"   ✅ {inner_norm}: {_status_label(inner_ext, True)} ({len(text):,} символов)"
+                )
+            else:
+                _log(f"   ⚠️ {inner_norm}: {_status_label(inner_ext, False)}")
+
+        docs_count = len(extracted)
+        chars_total = sum(len(t) for _, t in extracted)
+        _log(f"   Итого по архиву «{filename}»: документов={docs_count}, символов={chars_total:,}")
+        return extracted
+
+    # Файл верхнего уровня: уже уникален после dedupe_uploaded (MD5 + basename).
+    text = _read_document_bytes(file_bytes, filename)
+    if text:
+        extracted = [(filename, text)]
+    elif ext == ".pdf":
+        # PDF уже прошёл extract_text_from_pdf — не вызываем повторно через fallback
+        extracted = []
+    else:
+        try:
+            extracted = extract_documents_from_bytes(file_bytes, filename) or []
+        except Exception:
+            extracted = []
+
+    docs_count = len(extracted)
+    chars_total = sum(len(t) for _, t in extracted)
+    lines.append(f"   Статус: {_status_label(ext, docs_count > 0)}")
+    lines.append(f"   Документов извлечено: {docs_count}")
+    lines.append(f"   Символов: {chars_total:,}")
+    _log("\n".join(lines))
+    return extracted
+
+
+
+# =============================================================================
+# Ожидаемые 14 файлов
+# =============================================================================
+
+EXPECTED_FILES = [
+    "Извещение.docx",
+    "Закупочная документация.docx",
+    "Приложение № 1 - Техническое задание.doc",
+    "Приложение № 3 - График производства работ.doc",
+    "Приложение № 4 - График освоения и финансирования денежных средств.docx",
+    "Приложение № 5 - Акт окончания работ.docx",
+    "Проект Договора СМР-ПНР по САУГПТ и ЕСУМИС.docx",
+    "Техническое задание.pdf",
+    "ВОР Раздел ПД №12 ЛСР (02-01-01) САУГПТ.xlsx",
+    "ВОР Раздел ПД №12 ЛСР (02-01-02) ЕСУМИС.xlsx",
+    "Приложение № 5 к ТЗ - ЛСР САУГПТ.xlsx",
+    "Приложение № 6 к ТЗ - ЛСР ЕСУМИС.xlsx",
+    "14-27-00987 от 03.02.2026 РД САУГПТ.pdf",
+    "14-27-03537 от 20.04.2026 РД ЕСУМИС.pdf",
+]
+
+MASK_TECH = ("рд", "14-27-", "техническое задание", "техзадани", "/тз", "тз.", "рабочая документация", "саугпт", "есумис")
+MASK_ESTIMATE = ("лср", "вор")
+MASK_CONTRACT = ("договор",)
+MASK_NOTICE = ("извещение", "закупочная")
+MASK_SCHEDULE = ("график",)
+MASK_FINANCE_SCHED = ("освоения", "финансирования")
+
+# =============================================================================
+# Дедуп индекса
+# =============================================================================
+
+def _basename(source: str) -> str:
+    name = str(source).replace("\\", "/").split("/")[-1]
+    name = re.sub(r"\s*\(\d+\)(?=\.\w+$)", "", name)
+    return name
+
+
+def _norm(name: str) -> str:
+    return re.sub(r"\s+", " ", _basename(name).lower().strip())
+
+
+def _hash(text: str) -> str:
+    return hashlib.md5(re.sub(r"\s+", " ", (text or "").strip().lower()).encode("utf-8", errors="ignore")).hexdigest()
+
+
+def _match_expected(actual: str, expected: str) -> bool:
+    a, e = _norm(actual), _norm(expected)
+    if a == e or e in a or a in e:
+        return True
+    m = re.search(r"14-27-\d+", e)
+    if m and m.group(0) in a:
+        return True
+    pairs = [
+        ("график производства", "график производства"),
+        ("график освоения", "график освоения"),
+        ("акт окончания", "акт окончания"),
+        ("закупочная документация", "закупочная документация"),
+        ("извещение", "извещение"),
+    ]
+    for pe, pa in pairs:
+        if pe in e and pa in a:
+            return True
+    if "лср" in e and "лср" in a:
+        if ("саугпт" in e and "саугпт" in a) or ("есумис" in e and "есумис" in a):
+            return True
+    if "вор" in e and "вор" in a:
+        if ("саугпт" in e and "саугпт" in a) or ("есумис" in e and "есумис" in a):
+            return True
+    if "проект договора" in e and "договор" in a and "смр" in a:
+        return True
+    if "приложение № 1" in e and "техническое задание" in a and a.endswith(".doc"):
+        return True
+    if e.startswith("техническое задание") and a.startswith("техническое задание") and a.endswith(".pdf"):
+        return True
+    return False
+
+
+def build_dedup():
+    items = list(enumerate(zip(rag_index.chunks, rag_index.sources)))
+
+    def rank(src: str):
+        s = src.lower()
+        pen = (2 if "процедуре" in s else 0) + (1 if s.count(".zip/") + s.count(".rar/") > 1 else 0)
+        return (pen, len(s))
+
+    items.sort(key=lambda it: rank(it[1][1]))
+    seen: Set[str] = set()
+    chunks, sources, orig = [], [], []
+    for i, (t, s) in items:
+        h = _hash(t)
+        if h in seen:
+            continue
+        seen.add(h)
+        chunks.append(t)
+        sources.append(s)
+        orig.append(i)
+    return chunks, sources, orig
+
+
+def map_expected() -> List[Tuple[str, Optional[str]]]:
+    used: Set[str] = set()
+    out: List[Tuple[str, Optional[str]]] = []
+    for exp in EXPECTED_FILES:
+        found = None
+        for key, g in FILE_GROUPS.items():
+            if key in used:
+                continue
+            if _match_expected(key, exp) or _match_expected(g["display"], exp):
+                found = key
+                break
+        if found:
+            used.add(found)
+        out.append((exp, found))
+    for key in FILE_GROUPS:
+        if key not in used:
+            out.append((FILE_GROUPS[key]["display"], key))
+    return out
+
+
+# =============================================================================
+# Классификация документов + реквизиты писем/согласований
+# =============================================================================
+
+DOC_TYPE_LETTER = "Письмо-согласование"
+DOC_TYPE_RD = "Рабочая документация"
+DOC_TYPE_ESTIMATE = "Смета"
+DOC_TYPE_TZ = "Техническое задание"
+DOC_TYPE_CONTRACT = "Договор / приложение к договору"
+DOC_TYPE_NOTICE = "Извещение / закупочная документация"
+DOC_TYPE_SCHEDULE = "График"
+DOC_TYPE_ACT = "Акт"
+DOC_TYPE_OTHER = "Прочий документ"
+DOC_TYPE_SCAN = "Скан (тип не определён)"
+
+# Явные маркеры из ТЗ + расширения для OCR/типовых формулировок
+LETTER_KW = (
+    "письмо", "согласовани", "таможн", "таможен", "фтс", "обращение",
+    "уведомлени", "разрешени", "заключаем", "не возражаем", "рассмотрев",
+)
+RD_KW = (
+    "рабочая документация", "шифр", "альбом рд", "том рд",
+    "чертеж", "спецификац", "ведомость рабочих чертежей",
+)
+EST_KW = (
+    "смета", "сметн", "лср", "вор", "локальн",
+    "единичн расцен", "итого по смете",
+)
+TZ_KW = ("техническое задание", "предмет закупки", "требования к выполнению")
+CONTRACT_KW = ("договор", "подрядчик", "заказчик обязуется", "неустойк", "гарантийный срок")
+NOTICE_KW = ("извещение", "запрос предложений", "закупочная документация", "нмцк")
+SCHEDULE_KW = ("график производства", "график освоения", "этап работ")
+ACT_KW = ("акт окончания", "акт сдачи", "приёмк")
+
+# Ключевые слова ТЗ — достаточно одного явного маркера письма
+LETTER_CORE = ("письмо", "согласовани", "таможн", "таможен", "фтс", "обращение")
+
+
+def _file_sample_text(group_key: str, max_chars: int = 12000) -> str:
+    """Собрать текст файла из чанков (начало + середина) для классификации."""
+    g = FILE_GROUPS.get(group_key)
+    if not g:
+        return ""
+    idxs = g["idxs"]
+    parts = []
+    total = 0
+    # первые чанки + равномерно ещё несколько
+    pick = list(idxs[:4])
+    if len(idxs) > 8:
+        step = max(1, len(idxs) // 6)
+        pick.extend(idxs[4::step][:6])
+    elif len(idxs) > 4:
+        pick.extend(idxs[4:8])
+    seen = set()
+    for i in pick:
+        if i in seen:
+            continue
+        seen.add(i)
+        t = D_CHUNKS[i]
+        if total + len(t) > max_chars and parts:
+            break
+        parts.append(t)
+        total += len(t)
+    return "\n".join(parts)
+
+
+def _score_keywords(text_low: str, keywords: Sequence[str]) -> int:
+    return sum(1 for kw in keywords if kw in text_low)
+
+
+def _has_rd_token(text_low: str) -> bool:
+    """«РД» как отдельный токен (не часть другого слова)."""
+    return bool(re.search(r"(?<![a-zа-я0-9])рд(?![a-zа-я0-9])", text_low))
+
+
+def classify_document(display_name: str, text: str) -> Tuple[str, List[str]]:
+    """
+    Классификация по СОДЕРЖИМОМУ (приоритетнее имени файла).
+    Возвращает (тип, список сработавших признаков).
+
+    Правила ТЗ:
+      - письмо / согласование / таможня / ФТС / обращение → Письмо-согласование
+      - рабочая документация / РД / шифр → Рабочая документация
+      - смета / ЛСР / ВОР → Смета
+    """
+    name_low = _norm(display_name)
+    text_low = (text or "").lower()
+    blob = name_low + "\n" + text_low
+    hits: List[str] = []
+
+    letter_score = _score_keywords(text_low, LETTER_KW)
+    # Контент важнее имени: «14-27-… РД …» часто письмо таможни, а не альбом РД
+    if letter_score >= 1 and any(k in text_low for k in LETTER_CORE):
+        for kw in LETTER_KW:
+            if kw in text_low:
+                hits.append(kw)
+        return DOC_TYPE_LETTER, hits[:8]
+
+    rd_score = _score_keywords(blob, RD_KW)
+    if _has_rd_token(text_low):
+        rd_score += 1
+    est_score = _score_keywords(blob, EST_KW)
+    tz_score = _score_keywords(blob, TZ_KW)
+    contract_score = _score_keywords(blob, CONTRACT_KW)
+    notice_score = _score_keywords(blob, NOTICE_KW)
+    sched_score = _score_keywords(blob, SCHEDULE_KW)
+    act_score = _score_keywords(blob, ACT_KW)
+
+    # эвристики по имени (без 14-27-… — это часто исходящий № письма)
+    if "лср" in name_low or "вор" in name_low or "смет" in name_low:
+        est_score += 3
+    if "рабочая документация" in name_low or re.search(r"(?:^|[^a-zа-я0-9])рд(?:[^a-zа-я0-9]|$)", name_low):
+        # только если нет явных маркеров письма в тексте
+        if not any(k in text_low for k in LETTER_CORE):
+            rd_score += 2
+    if "техническое задание" in name_low or (name_low.endswith(".doc") and "приложение № 1" in name_low):
+        tz_score += 2
+    if "договор" in name_low:
+        contract_score += 2
+    if "извещение" in name_low or "закупочная" in name_low:
+        notice_score += 3
+    if "график" in name_low:
+        sched_score += 3
+    if "акт" in name_low:
+        act_score += 3
+
+    ranked = [
+        (est_score, DOC_TYPE_ESTIMATE, EST_KW),
+        (rd_score, DOC_TYPE_RD, RD_KW),
+        (tz_score, DOC_TYPE_TZ, TZ_KW),
+        (contract_score, DOC_TYPE_CONTRACT, CONTRACT_KW),
+        (notice_score, DOC_TYPE_NOTICE, NOTICE_KW),
+        (sched_score, DOC_TYPE_SCHEDULE, SCHEDULE_KW),
+        (act_score, DOC_TYPE_ACT, ACT_KW),
+        (letter_score, DOC_TYPE_LETTER, LETTER_KW),
+    ]
+    ranked.sort(key=lambda x: x[0], reverse=True)
+    best_score, best_type, best_kws = ranked[0]
+    if best_score <= 0:
+        # OCR-текст есть, но тип неясен
+        if len((text or "").strip()) > 40:
+            return DOC_TYPE_SCAN, ["текст есть, ключевых маркеров нет"]
+        return DOC_TYPE_OTHER, ["пусто / мало текста"]
+
+    for kw in best_kws:
+        if kw in blob:
+            hits.append(kw)
+    if best_type == DOC_TYPE_RD and _has_rd_token(text_low) and "рд" not in hits:
+        hits.append("рд")
+    return best_type, hits[:8]
+
+
+LETTER_EXTRACT_PROMPT = """Это текст документа. Определи, является ли он письмом / согласованием / разрешением.
+Если да — извлеки реквизиты СТРОГО в формате:
+
+Тип: Письмо-согласование
+Дата письма: ...
+Номер письма: ...
+Отправитель: ...
+Получатель: ...
+Суть согласования: ...
+Результат (согласовано/отказано/с замечаниями): ...
+
+Если какого-то поля нет — напиши «Не указано».
+Если это НЕ письмо/согласование — первой строкой напиши: Тип: не письмо
+и кратко что это за документ.
+"""
+
+
+def extract_letter_requisites(display_name: str, text: str) -> Dict[str, str]:
+    """Извлечение реквизитов письма через DeepSeek (+ regex-подсказки)."""
+    result = {
+        "Тип": DOC_TYPE_LETTER,
+        "Дата письма": "Не указано",
+        "Номер письма": "Не указано",
+        "Отправитель": "Не указано",
+        "Получатель": "Не указано",
+        "Суть согласования": "Не указано",
+        "Результат": "Не указано",
+        "Файл": display_name,
+    }
+    # regex-подсказки из имени файла: «14-27-03537 от 20.04.2026 …»
+    m_num = re.search(r"(14-27-\d+)", display_name)
+    m_date = re.search(r"от\s+(\d{2}[.\-]\d{2}[.\-]\d{4})", display_name, re.I)
+    if m_num:
+        result["Номер письма"] = m_num.group(1)
+    if m_date:
+        result["Дата письма"] = m_date.group(1).replace("-", ".")
+
+    if not (text or "").strip():
+        return result
+
+    try:
+        raw = ask_deepseek(LETTER_EXTRACT_PROMPT, context=text[:14000], timeout=DEEPSEEK_TIMEOUT)
+    except Exception as e:
+        result["Суть согласования"] = f"Ошибка извлечения: {e}"
+        return result
+
+    raw = (raw or "").strip()
+    if re.search(r"тип:\s*не письмо", raw, re.I):
+        result["Тип"] = "не письмо"
+        result["Суть согласования"] = raw
+        return result
+
+    def _field(patterns: Sequence[str]) -> Optional[str]:
+        for pat in patterns:
+            m = re.search(pat, raw, flags=re.I | re.M)
+            if m:
+                val = m.group(1).strip().strip(" .;")
+                if val and val.lower() not in ("не указано", "-", "нет"):
+                    return val
+        return None
+
+    date = _field([r"Дата письма:\s*(.+)", r"Дата:\s*(.+)"])
+    number = _field([r"Номер письма:\s*(.+)", r"№\s*([^\n]+)", r"Исх\.?\s*№?\s*([^\n]+)"])
+    sender = _field([r"Отправитель:\s*(.+)", r"От кого:\s*(.+)"])
+    receiver = _field([r"Получатель:\s*(.+)", r"Кому:\s*(.+)"])
+    essence = _field([r"Суть согласования:\s*(.+)", r"Суть:\s*(.+)"])
+    outcome = _field([r"Результат[^:]*:\s*(.+)", r"Решение:\s*(.+)"])
+
+    if date:
+        result["Дата письма"] = date
+    if number:
+        result["Номер письма"] = number
+    if sender:
+        result["Отправитель"] = sender
+    if receiver:
+        result["Получатель"] = receiver
+    if essence:
+        result["Суть согласования"] = essence
+    if outcome:
+        result["Результат"] = outcome
+
+    # доп. regex по самому тексту, если LLM не нашёл
+    if result["Дата письма"] == "Не указано":
+        m = re.search(r"\b(\d{2}[.\-/]\d{2}[.\-/]\d{4})\b", text[:2000])
+        if m:
+            result["Дата письма"] = m.group(1).replace("-", ".").replace("/", ".")
+    if result["Номер письма"] == "Не указано":
+        m = re.search(r"(?:исх\.?\s*№?|№)\s*([A-Za-zА-Яа-я0-9\-_/]+)", text[:2000], re.I)
+        if m:
+            result["Номер письма"] = m.group(1)
+
+    return result
+
+
+# =============================================================================
+# Поиск
+# =============================================================================
+
+def _mask_hit(source: str, masks: Sequence[str]) -> bool:
+    s = source.lower().replace("\\", "/")
+    b = _norm(source)
+    return any(m.lower() in s or m.lower() in b for m in masks)
+
+
+def search(
+    query: str,
+    top_k: int = TOP_K,
+    masks: Optional[Sequence[str]] = None,
+    mask_only: bool = False,
+) -> List[Dict[str, Any]]:
+    if _MAT is None:
+        return []
+    q = _VECT.transform([query])
+    scores = cosine_similarity(q, _MAT).ravel()
+    out = []
+    for i, sc in enumerate(scores):
+        src = D_SOURCES[i]
+        matched = _mask_hit(src, masks) if masks else False
+        if mask_only and masks and not matched:
+            continue
+        boost = 0.5 if matched else 0.0
+        if not masks:
+            for kw, b in (("извещение", 0.3), ("закупочная", 0.28), ("договор", 0.28),
+                          ("лср", 0.4), ("вор", 0.4), ("график", 0.35), ("рд", 0.25),
+                          ("техническое задание", 0.3)):
+                if kw in src.lower():
+                    boost = max(boost, b)
+        sc = float(sc) + boost
+        if sc <= 0:
+            continue
+        out.append({
+            "text": D_CHUNKS[i],
+            "source": src,
+            "score": sc,
+            "chunk": D_ORIG[i] + 1,
+            "base": _basename(src),
+        })
+    out.sort(key=lambda x: x["score"], reverse=True)
+    return out[:top_k]
+
+
+def merge_hits(lists: List[List[Dict[str, Any]]], top_k: int = TOP_K) -> List[Dict[str, Any]]:
+    best: Dict[Tuple[str, str], Dict[str, Any]] = {}
+    for hits in lists:
+        for h in hits:
+            key = (h["source"], h["text"][:160])
+            if key not in best or h["score"] > best[key]["score"]:
+                best[key] = h
+    return sorted(best.values(), key=lambda x: x["score"], reverse=True)[:top_k]
+
+
+def fmt_ctx(hits: List[Dict[str, Any]], max_chars: int = MAX_CTX) -> str:
+    parts, n = [], 0
+    for i, h in enumerate(hits, 1):
+        block = f"[Фрагмент {i} | {h['source']} | чанк #{h.get('chunk')} | {h['score']:.3f}]\n{h['text']}"
+        if n + len(block) > max_chars and parts:
+            break
+        parts.append(block)
+        n += len(block)
+    return "\n\n---\n\n".join(parts)
+
+
+def _empty(text: str) -> bool:
+    t = (text or "").strip()
+    if not t:
+        return True
+    low = t.lower()
+    marks = ["не указано", "не найдено", "нет информации", "в контексте нет",
+             "информация отсутствует", "не удалось", "ответить невозможно"]
+    if len(t) < 200 and any(m in low for m in marks):
+        if re.search(r"\d{3,}", t) and ("руб" in low or "%" in t or "инн" in low):
+            return False
+        return True
+    return False
+
+
+def clean(text: str) -> str:
+    text = (text or "").strip()
+    return "Не указано" if _empty(text) else text
+
+
+PRIORITY_PROMPT = (
+    "Отвечай только по контексту. Выпиши конкретные факты: числа, даты, суммы, перечни, нормы. "
+    "Не пиши «не указано», если в контексте есть хотя бы частичный ответ. "
+    "Если данные противоречивы — укажи оба варианта и источники. Ответ на русском."
+)
+
+
+def ask_rag(
+    question: str,
+    variants: Optional[List[str]] = None,
+    masks: Optional[Sequence[str]] = None,
+    mask_only: bool = False,
+    top_k: int = TOP_K,
+) -> Tuple[str, List[Dict[str, Any]]]:
+    variants = variants or []
+    # Для скорости: основной вопрос + максимум 1 вариант (не все)
+    queries = [question] + (variants[:1] if variants else [])
+    lists = []
+    for q in queries:
+        lists.append(search(q, top_k=top_k, masks=masks, mask_only=False))
+        if masks:
+            lists.append(search(q, top_k=TOP_K_FORCED, masks=masks, mask_only=True))
+    hits = merge_hits(lists, top_k=top_k)
+    if not hits:
+        return "Не указано", []
+    ans = clean(ask_deepseek(
+        f"{PRIORITY_PROMPT}\n\nВопрос: {question}",
+        context=fmt_ctx(hits),
+        timeout=DEEPSEEK_TIMEOUT,
+    ))
+    if ans == "Не указано" and variants:
+        rq = variants[-1] + " Приведи любые найденные факты из контекста."
+        rh = merge_hits(
+            [search(rq, top_k=top_k, masks=masks, mask_only=bool(masks)), hits],
+            top_k=top_k,
+        )
+        if rh:
+            ans2 = clean(ask_deepseek(
+                f"{PRIORITY_PROMPT}\n\nВопрос: {rq}",
+                context=fmt_ctx(rh),
+                timeout=DEEPSEEK_TIMEOUT,
+            ))
+            if ans2 != "Не указано":
+                return ans2, rh
+    return ans, hits
+
+
+# =============================================================================
+# Номер тендера
+# =============================================================================
+
+TENDER_RE = re.compile(r"(B\d{10,})", re.IGNORECASE)
+
+
+def find_tender_no() -> str:
+    names = []
+    if "uploaded_files" in globals() and uploaded_files:
+        names.extend(uploaded_files.keys())
+    names.extend(D_SOURCES)
+    for n in names:
+        m = TENDER_RE.search(str(n))
+        if m:
+            return m.group(1).upper()
+    return ""
+
+
+def _fmt_eta(seconds: float) -> str:
+    return _fmt_dur(seconds)
+
+
+def _progress_bar(done: int, total: int, t0: float, title: str = "") -> str:
+    total = max(1, total)
+    pct = 100.0 * done / total
+    width = 12
+    filled = min(width, max(0, int(round(width * done / total))))
+    bar = "█" * filled + "░" * (width - filled)
+    elapsed = time.time() - t0
+    if done > 0:
+        eta_s = _fmt_eta(elapsed * (total - done) / done)
+    else:
+        eta_s = "оценка…"
+    short = (title[:36] + "…") if len(title) > 37 else title
+    passed = _fmt_dur(_elapsed("start"))
+    return (
+        f"🔄 СТАТУС: вопрос {min(done + 1, total)}/{total} — {short}  | "
+        f"[{bar}] {pct:.0f}% (осталось {eta_s}, прошло {passed})"
+    )
+
+
+# =============================================================================
+# Сессионные глобальные переменные
+# =============================================================================
+
+uploaded_files = {}
+rag_index = RAGIndex(chunk_size=CHUNK_SIZE, chunk_overlap=CHUNK_OVERLAP)
+
+# Заполняются модулем 4 при анализе (нужны ask_rag / search)
+D_CHUNKS: List[str] = []
+D_SOURCES: List[str] = []
+D_ORIG: List[int] = []
+_VECT = None
+_MAT = None
+FILE_GROUPS: Dict[str, Any] = {}
+FILE_PLAN: List[Tuple[str, Optional[str]]] = []
+
+_mark("deps_end")
+print(f"⏱️ Модуль 1: {_fmt_dur(_elapsed('deps_start', 'deps_end'))}")
+print()
 print("✅ Система запущена. Теперь выполните модуль 2 (Загрузка данных).")
