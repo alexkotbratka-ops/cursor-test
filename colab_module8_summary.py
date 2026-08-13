@@ -476,12 +476,12 @@ def format_summary(rows: List[Dict[str, object]], formed_at: datetime) -> str:
         ("НМЦК", 8),
         ("Срок подачи", 12),
         ("Вердикт", 12),
-        ("Время", 10),
+        ("Время", 14),
         ("Дата анализа", 12),
     )
     head = "\t".join(_pad(h, w) for h, w in headers)
     lines.append(head)
-    lines.append("-" * min(130, max(70, len(head) + 8)))
+    lines.append("-" * min(140, max(70, len(head) + 8)))
 
     for i, r in enumerate(rows, start=1):
         vals = (
@@ -492,7 +492,7 @@ def format_summary(rows: List[Dict[str, object]], formed_at: datetime) -> str:
             (str(r["nmck"]), 8),
             (str(r["deadline"]), 12),
             (str(r["verdict"]), 12),
-            (str(r["time_label"]), 10),
+            (str(r["time_label"]), 14),
             (str(r["date"]), 12),
         )
         lines.append("\t".join(_pad(v, w) for v, w in vals))
