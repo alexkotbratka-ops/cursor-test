@@ -196,13 +196,44 @@ def _get_questions() -> List[Dict[str, Any]]:
     return out
 
 
+def _extract_short_tender_no(raw: str) -> str:
+    """Достаёт короткий номер (B… / ИКЗ) из длинного ответа на вопрос 1."""
+    s = (raw or "").strip()
+    if not s or s == NA:
+        return ""
+    if len(s) < 50:
+        return s
+    m = re.search(r"(B\d{10,})", s, re.IGNORECASE)
+    if m:
+        return m.group(1).upper()
+    m = re.search(r"\b(\d{18,36})\b", s)
+    if m:
+        return m.group(1)
+    return ""
+
+
 def _get_tender_no(ans: Dict[int, str]) -> str:
     g = globals()
     for key in ("tender_number", "tender_no"):
         v = g.get(key)
         if v and str(v).strip():
-            return str(v).strip()
-    return _na(ans.get(1, ""))
+            short = _extract_short_tender_no(str(v).strip())
+            return short or str(v).strip()[:40]
+    raw = str(ans.get(1, "") or "").strip()
+    short = _extract_short_tender_no(raw)
+    if short:
+        return short
+    return _na(raw[:40] if raw else "")
+
+
+def build_filename(tender_num: str = None) -> str:
+    """Формирует безопасное имя файла (макс. 100 символов)."""
+    date_str = datetime.now().strftime("%Y%m%d_%H%M%S")
+    if tender_num and tender_num != NA and len(tender_num) < 50:
+        # Очищаем номер тендера от недопустимых символов
+        safe_num = re.sub(r"[^\w\-]+", "_", tender_num)[:30]
+        return f"Отчёт_по_тендеру_{safe_num}_{date_str}.pdf"
+    return f"Отчёт_по_тендеру_{date_str}.pdf"
 
 
 def _find_txt_report() -> Optional[str]:
@@ -607,9 +638,10 @@ def _section_as_paragraphs(story: list, q_from: int, q_to: int, title: str) -> N
 # 6) Сборка PDF
 # =============================================================================
 
-safe_num = re.sub(r"[^\w\-]+", "_", TENDER_NO) if TENDER_NO and TENDER_NO != NA else "без_номера"
-date_tag = REPORT_DATE.strftime("%Y%m%d")
-PDF_NAME = f"Отчёт_по_тендеру_{safe_num}_{date_tag}.pdf"
+PDF_NAME = build_filename(None if (not TENDER_NO or TENDER_NO == NA) else TENDER_NO)
+if len(PDF_NAME) > 100:
+    # страховка: даже при странном номере не превышаем лимит имени
+    PDF_NAME = build_filename(None)
 if os.path.isdir("/content"):
     PDF_PATH = os.path.join("/content", PDF_NAME)
 else:
