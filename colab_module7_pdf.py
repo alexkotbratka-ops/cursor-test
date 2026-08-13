@@ -1,0 +1,627 @@
+# =============================================================================
+# МОДУЛЬ 7 — PDF-отчёт по тендеру (Google Colab)
+# Выполняйте ПОСЛЕ модуля 4 или модуля 5.
+#
+# Вход:
+#   - ответы на 86 вопросов из сессии (answers / tender_answers)
+#   - QUESTIONS, номер тендера, TXT-отчёт (если есть)
+# Выход:
+#   - Отчёт_по_тендеру_[НОМЕР]_[ДАТА].pdf (строгий ч/б стиль)
+# =============================================================================
+
+import os
+import re
+import subprocess
+import sys
+import time
+from datetime import datetime
+from pathlib import Path
+from typing import Any, Dict, List, Optional, Sequence, Tuple
+
+_T0 = time.time()
+print("=" * 70)
+print("🚀 МОДУЛЬ 7 — Формирование PDF-отчёта по тендеру")
+print("=" * 70)
+
+# =============================================================================
+# 1) Зависимости
+# =============================================================================
+
+print("📦 Установка reportlab и шрифтов…")
+
+
+def _run(cmd: List[str]) -> None:
+    subprocess.run(cmd, check=False, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+
+_run(["apt-get", "update", "-qq"])
+# Liberation Serif — метрический аналог Times New Roman (открытый)
+_run(["apt-get", "install", "-y", "-qq", "fonts-liberation", "fonts-liberation2"])
+# Попытка поставить настоящий Times New Roman (может требовать EULA — не критично)
+_run(["apt-get", "install", "-y", "-qq", "ttf-mscorefonts-installer"])
+
+subprocess.check_call(
+    [sys.executable, "-m", "pip", "install", "-q", "reportlab"],
+    stdout=subprocess.DEVNULL,
+    stderr=subprocess.STDOUT,
+)
+
+from reportlab.lib import colors
+from reportlab.lib.enums import TA_CENTER, TA_JUSTIFY, TA_LEFT
+from reportlab.lib.pagesizes import A4
+from reportlab.lib.styles import ParagraphStyle, getSampleStyleSheet
+from reportlab.lib.units import mm
+from reportlab.pdfbase import pdfmetrics
+from reportlab.pdfbase.ttfonts import TTFont
+from reportlab.platypus import (
+    Paragraph,
+    SimpleDocTemplate,
+    Spacer,
+    Table,
+    TableStyle,
+)
+
+print("✅ Зависимости готовы.\n")
+
+# =============================================================================
+# 2) Шрифты: Times New Roman (или Liberation Serif как замена)
+# =============================================================================
+
+COMPANY_NAME = 'ООО «Пожарная Автоматика»'
+FONT_REG = "TimesNewRoman"
+FONT_BOLD = "TimesNewRoman-Bold"
+
+
+def _register_times_fonts() -> Tuple[str, str]:
+    """Регистрирует Times New Roman или Liberation Serif под теми же именами."""
+    candidates_reg = [
+        "/usr/share/fonts/truetype/msttcorefonts/Times_New_Roman.ttf",
+        "/usr/share/fonts/truetype/msttcorefonts/times.ttf",
+        "/usr/share/fonts/truetype/liberation/LiberationSerif-Regular.ttf",
+        "/usr/share/fonts/truetype/liberation2/LiberationSerif-Regular.ttf",
+    ]
+    candidates_bold = [
+        "/usr/share/fonts/truetype/msttcorefonts/Times_New_Roman_Bold.ttf",
+        "/usr/share/fonts/truetype/msttcorefonts/timesbd.ttf",
+        "/usr/share/fonts/truetype/liberation/LiberationSerif-Bold.ttf",
+        "/usr/share/fonts/truetype/liberation2/LiberationSerif-Bold.ttf",
+    ]
+    reg_path = next((p for p in candidates_reg if os.path.isfile(p)), None)
+    bold_path = next((p for p in candidates_bold if os.path.isfile(p)), None)
+    if not reg_path or not bold_path:
+        raise RuntimeError(
+            "❌ Не найдены TTF-шрифты Times/Liberation Serif. "
+            "Установите fonts-liberation в Colab и перезапустите модуль 7."
+        )
+    pdfmetrics.registerFont(TTFont(FONT_REG, reg_path))
+    pdfmetrics.registerFont(TTFont(FONT_BOLD, bold_path))
+    src = "Times New Roman" if "msttcore" in reg_path or "times" in reg_path.lower() else "Liberation Serif → Times New Roman"
+    print(f"🖋 Шрифт: {src}")
+    print(f"   regular: {reg_path}")
+    print(f"   bold:    {bold_path}")
+    return FONT_REG, FONT_BOLD
+
+
+_register_times_fonts()
+
+# =============================================================================
+# 3) Данные из сессии / TXT
+# =============================================================================
+
+NA = "Не указано"
+
+
+def _na(val: Any) -> str:
+    s = str(val or "").strip()
+    if not s or s.lower() in {"none", "null", "nan", "-", "—"}:
+        return NA
+    return s
+
+
+def _get_answers() -> Dict[int, str]:
+    """answers / tender_answers из модулей 4 или 5."""
+    g = globals()
+    raw = g.get("tender_answers")
+    if not isinstance(raw, dict):
+        raw = g.get("answers")
+    if not isinstance(raw, dict):
+        return {}
+    out: Dict[int, str] = {}
+    for k, v in raw.items():
+        try:
+            out[int(k)] = _na(v)
+        except Exception:
+            continue
+    return out
+
+
+def _get_questions() -> List[Dict[str, Any]]:
+    qs = globals().get("QUESTIONS")
+    if isinstance(qs, list) and qs:
+        return list(qs)
+    # Минимальный каркас, если QUESTIONS нет в сессии
+    sections = [
+        (range(1, 12), "1. ОБЩАЯ ИНФОРМАЦИЯ"),
+        (range(12, 22), "2. ТРЕБОВАНИЯ К УЧАСТНИКАМ"),
+        (range(22, 38), "3. ТЕХНИЧЕСКИЕ ТРЕБОВАНИЯ"),
+        (range(38, 54), "4. УСЛОВИЯ КОНТРАКТА"),
+        (range(54, 67), "5. ФИНАНСОВЫЕ УСЛОВИЯ"),
+        (range(67, 79), "6. РИСКИ И РЕКОМЕНДАЦИИ"),
+        (range(79, 87), "7. СТАТИСТИКА И ПОЛНОТА АНАЛИЗА"),
+    ]
+    titles = {
+        1: "Номер тендера / ИКЗ",
+        2: "Полное название объекта закупки",
+        4: "Заказчик (название)",
+        5: "ИНН заказчика",
+        6: "Контакты заказчика",
+        11: "Вид процедуры",
+        41: "Срок подачи заявок",
+        42: "Время окончания подачи заявок",
+        54: "НМЦК",
+        74: "Рекомендация по участию",
+        75: "Ключевые выводы",
+        77: "Оценка экономической целесообразности",
+        78: "Рекомендация по цене предложения",
+        86: "Общий вывод по полноте анализа",
+    }
+    out = []
+    for rng, sec in sections:
+        for n in rng:
+            out.append({
+                "num": n,
+                "section": sec,
+                "title": titles.get(n, f"Вопрос {n}"),
+                "question": "",
+            })
+    return out
+
+
+def _get_tender_no(ans: Dict[int, str]) -> str:
+    g = globals()
+    for key in ("tender_number", "tender_no"):
+        v = g.get(key)
+        if v and str(v).strip():
+            return str(v).strip()
+    return _na(ans.get(1, ""))
+
+
+def _find_txt_report() -> Optional[str]:
+    """Ищет TXT-отчёт модуля 4/5 в сессии или в /content."""
+    for key in ("tender_report_filename", "report_filename"):
+        p = globals().get(key)
+        if p and os.path.isfile(str(p)):
+            return str(p)
+    # glob
+    roots = []
+    if os.path.isdir("/content"):
+        roots.append(Path("/content"))
+    roots.append(Path("."))
+    found: List[Path] = []
+    for root in roots:
+        found.extend(root.glob("Анализ_тендера_*.txt"))
+        found.extend(root.glob("**/Анализ_тендера_*.txt"))
+    if not found:
+        return None
+    found.sort(key=lambda p: p.stat().st_mtime, reverse=True)
+    return str(found[0])
+
+
+def _parse_answers_from_txt(path: str) -> Dict[int, str]:
+    """Разбор TXT-отчёта: «N. Заголовок» + текст ответа до следующего вопроса."""
+    try:
+        text = Path(path).read_text(encoding="utf-8", errors="replace")
+    except Exception as e:
+        print(f"  ⚠️ Не удалось прочитать TXT: {e}")
+        return {}
+    # Блоки вида: "12. Название\n----\nответ"
+    pattern = re.compile(
+        r"(?m)^(\d{1,2})\.\s+(.+?)\n-+\n(.*?)(?=\n\d{1,2}\.\s|\n={3,}|\Z)",
+        re.S,
+    )
+    out: Dict[int, str] = {}
+    for m in pattern.finditer(text):
+        num = int(m.group(1))
+        body = m.group(3).strip()
+        # убрать строку источников
+        body = re.sub(r"(?m)^Источники:.*$", "", body).strip()
+        out[num] = _na(body)
+    return out
+
+
+def _get_report_date() -> datetime:
+    ad = globals().get("ANALYSIS_DATE")
+    if isinstance(ad, datetime):
+        return ad
+    return datetime.now()
+
+
+ANSWERS = _get_answers()
+TXT_PATH = _find_txt_report()
+if TXT_PATH:
+    print(f"📄 TXT-отчёт: {TXT_PATH}")
+    parsed = _parse_answers_from_txt(TXT_PATH)
+    # TXT дополняет пустые ответы сессии
+    for k, v in parsed.items():
+        if k not in ANSWERS or ANSWERS[k] == NA:
+            ANSWERS[k] = v
+else:
+    print("📄 TXT-отчёт не найден — используем данные сессии.")
+
+if not ANSWERS:
+    raise RuntimeError(
+        "❌ Нет данных для PDF. Сначала выполните модуль 4 или модуль 5 "
+        "(нужны answers / tender_answers или файл Анализ_тендера_*.txt)."
+    )
+
+QUESTIONS_M7 = _get_questions()
+TENDER_NO = _get_tender_no(ANSWERS)
+REPORT_DATE = _get_report_date()
+print(f"🔖 Номер тендера: {TENDER_NO}")
+print(f"📊 Ответов: {len(ANSWERS)}")
+
+# =============================================================================
+# 4) Вердикт
+# =============================================================================
+
+
+def _classify_verdict(text: str) -> Tuple[str, str, colors.Color]:
+    """
+    Возвращает (метка, короткий код, цвет рамки).
+    🟢 Участвовать / 🟡 Рассмотреть / 🔴 Пропустить
+    """
+    t = (text or "").lower()
+    # негатив раньше позитива (иначе «не участвовать» попадёт в «участвовать»)
+    skip_kw = (
+        "не участвовать", "не рекоменду", "пропустить", "отказаться",
+        "нецелесообраз", "высокий риск без", "не стоит",
+    )
+    go_kw = (
+        "участвовать", "рекомендуется участие", "рекомендую участвовать",
+        "целесообразно участвовать", "можно участвовать",
+    )
+    mid_kw = (
+        "осторожн", "рассмотр", "условн", "при уточнении", "после проверки",
+        "с оговорк", "требует уточн",
+    )
+    has_skip = any(k in t for k in skip_kw)
+    has_go = any(k in t for k in go_kw)
+    has_mid = any(k in t for k in mid_kw)
+    if has_skip:
+        return "🔴 Пропустить", "SKIP", colors.HexColor("#8B0000")
+    # «участвовать с осторожностью» → рассмотреть
+    if has_go and has_mid:
+        return "🟡 Рассмотреть", "REVIEW", colors.HexColor("#8B6914")
+    if has_go:
+        return "🟢 Участвовать", "GO", colors.HexColor("#006400")
+    if has_mid:
+        return "🟡 Рассмотреть", "REVIEW", colors.HexColor("#8B6914")
+    # эвристика по экономической оценке
+    eco = _na(ANSWERS.get(77, "")).lower()
+    if "нецелесообраз" in eco or "не рекомендуется" in eco:
+        return "🔴 Пропустить", "SKIP", colors.HexColor("#8B0000")
+    if "осторож" in eco or "риск" in eco:
+        return "🟡 Рассмотреть", "REVIEW", colors.HexColor("#8B6914")
+    if text and text != NA:
+        return "🟡 Рассмотреть", "REVIEW", colors.HexColor("#8B6914")
+    return "🟡 Рассмотреть", "REVIEW", colors.HexColor("#8B6914")
+
+
+VERDICT_TEXT = _na(ANSWERS.get(74, ""))
+VERDICT_LABEL, VERDICT_CODE, VERDICT_COLOR = _classify_verdict(VERDICT_TEXT)
+
+# =============================================================================
+# 5) Стили
+# =============================================================================
+
+styles = getSampleStyleSheet()
+
+style_title = ParagraphStyle(
+    "M7Title",
+    fontName=FONT_BOLD,
+    fontSize=16,
+    leading=20,
+    alignment=TA_CENTER,
+    spaceAfter=8,
+    textColor=colors.black,
+)
+style_company = ParagraphStyle(
+    "M7Company",
+    fontName=FONT_BOLD,
+    fontSize=11,
+    leading=14,
+    alignment=TA_CENTER,
+    spaceAfter=2,
+    textColor=colors.black,
+)
+style_meta = ParagraphStyle(
+    "M7Meta",
+    fontName=FONT_REG,
+    fontSize=11,
+    leading=14,
+    alignment=TA_CENTER,
+    spaceAfter=2,
+    textColor=colors.black,
+)
+style_h1 = ParagraphStyle(
+    "M7H1",
+    fontName=FONT_BOLD,
+    fontSize=12,
+    leading=15,
+    alignment=TA_LEFT,
+    spaceBefore=12,
+    spaceAfter=8,
+    textColor=colors.black,
+)
+style_q_title = ParagraphStyle(
+    "M7QTitle",
+    fontName=FONT_BOLD,
+    fontSize=11,
+    leading=14,
+    alignment=TA_LEFT,
+    spaceBefore=8,
+    spaceAfter=2,
+    textColor=colors.black,
+)
+style_body = ParagraphStyle(
+    "M7Body",
+    fontName=FONT_REG,
+    fontSize=11,
+    leading=14,
+    alignment=TA_JUSTIFY,
+    spaceAfter=4,
+    textColor=colors.black,
+)
+style_cell = ParagraphStyle(
+    "M7Cell",
+    fontName=FONT_REG,
+    fontSize=11,
+    leading=13,
+    alignment=TA_LEFT,
+    textColor=colors.black,
+)
+style_cell_bold = ParagraphStyle(
+    "M7CellBold",
+    fontName=FONT_BOLD,
+    fontSize=11,
+    leading=13,
+    alignment=TA_LEFT,
+    textColor=colors.black,
+)
+style_verdict = ParagraphStyle(
+    "M7Verdict",
+    fontName=FONT_BOLD,
+    fontSize=12,
+    leading=15,
+    alignment=TA_CENTER,
+    textColor=colors.black,
+)
+style_footer = ParagraphStyle(
+    "M7Footer",
+    fontName=FONT_REG,
+    fontSize=9,
+    leading=11,
+    alignment=TA_CENTER,
+    textColor=colors.black,
+)
+
+
+def _p(text: Any, style: ParagraphStyle = style_body) -> Paragraph:
+    s = _na(text)
+    # экранирование для reportlab XML
+    s = (
+        s.replace("&", "&amp;")
+        .replace("<", "&lt;")
+        .replace(">", "&gt;")
+        .replace("\n", "<br/>")
+    )
+    return Paragraph(s, style)
+
+
+def _kv_table(rows: List[Tuple[str, str]], col_widths: Optional[Sequence[float]] = None) -> Table:
+    data = [[_p(k, style_cell_bold), _p(v, style_cell)] for k, v in rows]
+    w = list(col_widths) if col_widths else [55 * mm, 125 * mm]
+    t = Table(data, colWidths=w, hAlign="LEFT")
+    t.setStyle(
+        TableStyle(
+            [
+                ("FONTNAME", (0, 0), (-1, -1), FONT_REG),
+                ("FONTSIZE", (0, 0), (-1, -1), 11),
+                ("VALIGN", (0, 0), (-1, -1), "TOP"),
+                ("GRID", (0, 0), (-1, -1), 0.6, colors.black),
+                ("LEFTPADDING", (0, 0), (-1, -1), 4),
+                ("RIGHTPADDING", (0, 0), (-1, -1), 4),
+                ("TOPPADDING", (0, 0), (-1, -1), 3),
+                ("BOTTOMPADDING", (0, 0), (-1, -1), 3),
+                ("BACKGROUND", (0, 0), (0, -1), colors.Color(0.95, 0.95, 0.95)),
+            ]
+        )
+    )
+    return t
+
+
+def _section_questions(story: list, q_from: int, q_to: int, title: str) -> None:
+    story.append(Paragraph(title, style_h1))
+    by_num = {int(q["num"]): q for q in QUESTIONS_M7 if "num" in q}
+    for n in range(q_from, q_to + 1):
+        q = by_num.get(n, {"num": n, "title": f"Вопрос {n}"})
+        title_q = f"{n}. {_na(q.get('title', f'Вопрос {n}'))}"
+        story.append(Paragraph(title_q, style_q_title))
+        story.append(_p(ANSWERS.get(n, NA), style_body))
+
+
+# =============================================================================
+# 6) Сборка PDF
+# =============================================================================
+
+safe_num = re.sub(r"[^\w\-]+", "_", TENDER_NO) if TENDER_NO and TENDER_NO != NA else "без_номера"
+date_tag = REPORT_DATE.strftime("%Y%m%d")
+PDF_NAME = f"Отчёт_по_тендеру_{safe_num}_{date_tag}.pdf"
+if os.path.isdir("/content"):
+    PDF_PATH = os.path.join("/content", PDF_NAME)
+else:
+    PDF_PATH = os.path.abspath(PDF_NAME)
+
+print(f"📝 Формирование PDF: {PDF_PATH}")
+
+
+def _add_page_footer(canvas, doc):
+    canvas.saveState()
+    canvas.setFont(FONT_REG, 9)
+    canvas.setFillColor(colors.black)
+    y = 12 * mm
+    canvas.drawCentredString(
+        A4[0] / 2,
+        y,
+        f"{COMPANY_NAME}  |  дата формирования: {REPORT_DATE.strftime('%d.%m.%Y %H:%M')}  |  стр. {doc.page}",
+    )
+    canvas.setStrokeColor(colors.black)
+    canvas.setLineWidth(0.5)
+    canvas.line(20 * mm, y + 5 * mm, A4[0] - 20 * mm, y + 5 * mm)
+    canvas.restoreState()
+
+
+doc = SimpleDocTemplate(
+    PDF_PATH,
+    pagesize=A4,
+    leftMargin=20 * mm,
+    rightMargin=20 * mm,
+    topMargin=18 * mm,
+    bottomMargin=20 * mm,
+    title=f"Отчёт по тендеру {TENDER_NO}",
+    author=COMPANY_NAME,
+)
+
+story: list = []
+
+# --- Заголовок и шапка ---
+story.append(Paragraph("ОТЧЁТ ПО ТЕНДЕРУ", style_title))
+story.append(Paragraph(COMPANY_NAME, style_company))
+story.append(Paragraph(f"Дата анализа: {REPORT_DATE.strftime('%d.%m.%Y %H:%M')}", style_meta))
+story.append(Paragraph(f"Номер тендера / ИКЗ: {_na(TENDER_NO)}", style_meta))
+story.append(Spacer(1, 8 * mm))
+
+# --- Сводная карточка ---
+story.append(Paragraph("СВОДНАЯ КАРТОЧКА ТЕНДЕРА", style_h1))
+
+# Площадка / ссылки — ищем по ключевым словам в ответах 1–20, иначе Н/Д
+def _find_answer_by_title_keywords(keywords: Sequence[str]) -> str:
+    for q in QUESTIONS_M7:
+        title = str(q.get("title", "")).lower()
+        if any(k in title for k in keywords):
+            return _na(ANSWERS.get(int(q["num"]), NA))
+    return NA
+
+
+platform = _find_answer_by_title_keywords(("площадк", "сайт", "еис", "этп", "электронн"))
+links = _find_answer_by_title_keywords(("ссылк", "url", "адрес извещ"))
+# Срок подачи — вопросы 41–42 (эталон модулей 1/4/5)
+deadline_date = _na(ANSWERS.get(41, NA))
+deadline_time = _na(ANSWERS.get(42, NA))
+if deadline_date != NA and deadline_time != NA:
+    deadline = f"{deadline_date}, {deadline_time}"
+elif deadline_date != NA:
+    deadline = deadline_date
+else:
+    deadline = _find_answer_by_title_keywords(
+        ("срок подачи", "окончания подачи", "дата подачи", "приёма заявок", "приема заявок")
+    )
+
+summary_rows = [
+    ("Номер тендера / ИКЗ", _na(TENDER_NO)),
+    ("Заказчик", _na(ANSWERS.get(4, NA))),
+    ("ИНН заказчика", _na(ANSWERS.get(5, NA))),
+    ("Контакты заказчика", _na(ANSWERS.get(6, NA))),
+    ("Предмет закупки", _na(ANSWERS.get(2, NA))),
+    ("НМЦК", _na(ANSWERS.get(54, NA))),
+    ("Срок подачи заявки", deadline if deadline != NA else "Не указано"),
+    ("Способ отбора", _na(ANSWERS.get(11, NA))),
+    ("Площадка", platform if platform != NA else "Не указано"),
+    ("Ссылки", links if links != NA else "Не указано"),
+    ("Вердикт", VERDICT_LABEL),
+]
+story.append(_kv_table(summary_rows))
+story.append(Spacer(1, 4 * mm))
+
+# Рамка вердикта
+verdict_inner = [
+    [Paragraph(f"ИТОГОВЫЙ ВЕРДИКТ: {VERDICT_LABEL}", style_verdict)],
+    [_p(VERDICT_TEXT if VERDICT_TEXT != NA else "Рекомендация по участию не сформирована.", style_body)],
+]
+vt = Table(verdict_inner, colWidths=[180 * mm])
+vt.setStyle(
+    TableStyle(
+        [
+            ("BOX", (0, 0), (-1, -1), 1.5, VERDICT_COLOR),
+            ("LEFTPADDING", (0, 0), (-1, -1), 8),
+            ("RIGHTPADDING", (0, 0), (-1, -1), 8),
+            ("TOPPADDING", (0, 0), (-1, -1), 6),
+            ("BOTTOMPADDING", (0, 0), (-1, -1), 6),
+            ("BACKGROUND", (0, 0), (-1, 0), colors.Color(0.93, 0.93, 0.93)),
+            ("VALIGN", (0, 0), (-1, -1), "TOP"),
+        ]
+    )
+)
+story.append(vt)
+story.append(Spacer(1, 6 * mm))
+
+# --- Разделы 1–7 ---
+_section_questions(story, 1, 11, "1. ОБЩАЯ ИНФОРМАЦИЯ")
+_section_questions(story, 12, 21, "2. ТРЕБОВАНИЯ К УЧАСТНИКАМ")
+_section_questions(story, 22, 37, "3. ТЕХНИЧЕСКИЕ ТРЕБОВАНИЯ")
+_section_questions(story, 38, 53, "4. УСЛОВИЯ КОНТРАКТА")
+_section_questions(story, 54, 66, "5. ФИНАНСОВЫЕ УСЛОВИЯ")
+_section_questions(story, 67, 78, "6. РИСКИ И РЕКОМЕНДАЦИИ")
+_section_questions(story, 79, 86, "7. СТАТИСТИКА И ПОЛНОТА АНАЛИЗА")
+
+# --- Итоговый вердикт (развёрнутый) ---
+story.append(Paragraph("ИТОГОВЫЙ ВЕРДИКТ", style_h1))
+story.append(_kv_table([
+    ("Рекомендация", VERDICT_LABEL),
+    ("Обоснование", VERDICT_TEXT),
+    ("Ключевые выводы", _na(ANSWERS.get(75, NA))),
+    ("Экономическая целесообразность", _na(ANSWERS.get(77, NA))),
+    ("Рекомендация по цене", _na(ANSWERS.get(78, NA))),
+    ("Полнота анализа", _na(ANSWERS.get(86, NA))),
+]))
+story.append(Spacer(1, 4 * mm))
+story.append(_p(
+    "Рекомендации по участию: руководствуйтесь разделом 6 (риски) и вердиктом выше. "
+    "При статусе «Рассмотреть» уточните недостающие данные до подачи заявки. "
+    "При статусе «Пропустить» участие не рекомендуется без изменения условий закупки.",
+    style_body,
+))
+
+# --- Футер на последней странице (дублирует колонтитул) ---
+story.append(Spacer(1, 10 * mm))
+story.append(Paragraph("—" * 40, style_meta))
+story.append(Paragraph(COMPANY_NAME, style_company))
+story.append(Paragraph(
+    f"Дата формирования отчёта: {REPORT_DATE.strftime('%d.%m.%Y %H:%M')}",
+    style_meta,
+))
+
+doc.build(story, onFirstPage=_add_page_footer, onLaterPages=_add_page_footer)
+
+# Сохраняем в сессию
+tender_pdf_filename = PDF_PATH
+tender_pdf_verdict = VERDICT_LABEL
+
+# Скачивание в Colab
+try:
+    from google.colab import files as colab_files
+    colab_files.download(PDF_PATH)
+    print("📥 PDF скачан автоматически.")
+except Exception:
+    print("💾 Автоскачивание недоступно (не Colab) — файл сохранён локально.")
+
+elapsed = time.time() - _T0
+print()
+print("=" * 70)
+print("✅ PDF-отчёт сформирован!")
+print(f"📁 Файл: {PDF_PATH}")
+print(f"🔖 Тендер: {TENDER_NO}")
+print(f"⚖ Вердикт: {VERDICT_LABEL}")
+print(f"⏱ Время: {int(round(elapsed))} сек.")
+print("=" * 70)
+print("Модуль 7 завершён.")
