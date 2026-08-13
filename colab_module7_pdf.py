@@ -34,17 +34,31 @@ def _run(cmd: List[str]) -> None:
     subprocess.run(cmd, check=False, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 
 
-_run(["apt-get", "update", "-qq"])
-# Liberation Serif — метрический аналог Times New Roman (открытый)
-_run(["apt-get", "install", "-y", "-qq", "fonts-liberation", "fonts-liberation2"])
-# Попытка поставить настоящий Times New Roman (может требовать EULA — не критично)
-_run(["apt-get", "install", "-y", "-qq", "ttf-mscorefonts-installer"])
+def _font_present() -> bool:
+    candidates = [
+        "/usr/share/fonts/truetype/msttcorefonts/Times_New_Roman.ttf",
+        "/usr/share/fonts/truetype/msttcorefonts/times.ttf",
+        "/usr/share/fonts/truetype/liberation/LiberationSerif-Regular.ttf",
+        "/usr/share/fonts/truetype/liberation2/LiberationSerif-Regular.ttf",
+    ]
+    return any(os.path.isfile(p) for p in candidates)
 
-subprocess.check_call(
-    [sys.executable, "-m", "pip", "install", "-q", "reportlab"],
-    stdout=subprocess.DEVNULL,
-    stderr=subprocess.STDOUT,
-)
+
+if not _font_present():
+    _run(["apt-get", "update", "-qq"])
+    # Liberation Serif — метрический аналог Times New Roman (открытый)
+    _run(["apt-get", "install", "-y", "-qq", "fonts-liberation", "fonts-liberation2"])
+    # Попытка поставить настоящий Times New Roman (может требовать EULA — не критично)
+    _run(["apt-get", "install", "-y", "-qq", "ttf-mscorefonts-installer"])
+
+try:
+    import reportlab  # noqa: F401
+except ImportError:
+    subprocess.check_call(
+        [sys.executable, "-m", "pip", "install", "-q", "reportlab"],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.STDOUT,
+    )
 
 from reportlab.lib import colors
 from reportlab.lib.enums import TA_CENTER, TA_JUSTIFY, TA_LEFT
@@ -115,6 +129,10 @@ def _na(val: Any) -> str:
     s = str(val or "").strip()
     if not s or s.lower() in {"none", "null", "nan", "-", "—"}:
         return NA
+    # унификация пустых/служебных ответов
+    low = s.lower()
+    if low in {"n/a", "na", "не применимо", "неприменимо", "не задано"}:
+        return "Не применимо" if "примен" in low else NA
     return s
 
 
@@ -207,26 +225,35 @@ def _find_txt_report() -> Optional[str]:
     return str(found[0])
 
 
-def _parse_answers_from_txt(path: str) -> Dict[int, str]:
-    """Разбор TXT-отчёта: «N. Заголовок» + текст ответа до следующего вопроса."""
+def _parse_answers_from_txt(path: str) -> Tuple[Dict[int, str], Dict[int, str]]:
+    """Разбор TXT-отчёта: «N. Заголовок» + текст ответа до следующего вопроса.
+
+    Возвращает (answers, titles).
+    """
     try:
         text = Path(path).read_text(encoding="utf-8", errors="replace")
     except Exception as e:
         print(f"  ⚠️ Не удалось прочитать TXT: {e}")
-        return {}
+        return {}, {}
     # Блоки вида: "12. Название\n----\nответ"
+    # Важно: заголовок без перевода строки (иначе «2. ТРЕБОВАНИЯ…\\n====\\n\\n12. …\\n----»
+    # ошибочно съедает вопрос 12). Следующий вопрос — только с подчёркиванием ----.
     pattern = re.compile(
-        r"(?m)^(\d{1,2})\.\s+(.+?)\n-+\n(.*?)(?=\n\d{1,2}\.\s|\n={3,}|\Z)",
+        r"(?m)^(\d{1,2})\.\s+([^\n]+)\n-{3,}\n(.*?)(?=\n\d{1,2}\.\s+[^\n]+\n-{3,}|\n={3,}|\Z)",
         re.S,
     )
     out: Dict[int, str] = {}
+    titles: Dict[int, str] = {}
     for m in pattern.finditer(text):
         num = int(m.group(1))
+        if num < 1 or num > 86:
+            continue
+        titles[num] = m.group(2).strip()
         body = m.group(3).strip()
         # убрать строку источников
         body = re.sub(r"(?m)^Источники:.*$", "", body).strip()
         out[num] = _na(body)
-    return out
+    return out, titles
 
 
 def _get_report_date() -> datetime:
@@ -237,10 +264,11 @@ def _get_report_date() -> datetime:
 
 
 ANSWERS = _get_answers()
+TXT_TITLES: Dict[int, str] = {}
 TXT_PATH = _find_txt_report()
 if TXT_PATH:
     print(f"📄 TXT-отчёт: {TXT_PATH}")
-    parsed = _parse_answers_from_txt(TXT_PATH)
+    parsed, TXT_TITLES = _parse_answers_from_txt(TXT_PATH)
     # TXT дополняет пустые ответы сессии
     for k, v in parsed.items():
         if k not in ANSWERS or ANSWERS[k] == NA:
@@ -255,6 +283,14 @@ if not ANSWERS:
     )
 
 QUESTIONS_M7 = _get_questions()
+# Подтянуть названия вопросов из TXT, если в сессии нет полного QUESTIONS
+if TXT_TITLES:
+    by_num = {int(q["num"]): q for q in QUESTIONS_M7 if "num" in q}
+    for n, title in TXT_TITLES.items():
+        if n in by_num:
+            cur = str(by_num[n].get("title", ""))
+            if (not cur) or cur.startswith("Вопрос "):
+                by_num[n]["title"] = title
 TENDER_NO = _get_tender_no(ANSWERS)
 REPORT_DATE = _get_report_date()
 print(f"🔖 Номер тендера: {TENDER_NO}")
@@ -265,9 +301,16 @@ print(f"📊 Ответов: {len(ANSWERS)}")
 # =============================================================================
 
 
-def _classify_verdict(text: str) -> Tuple[str, str, colors.Color]:
+# Метки вердикта: цветные круги (emoji) для консоли Colab;
+# в PDF Times/Liberation emoji нет — рисуем ● + цветную рамку.
+_VERDICT_GO = ("🟢 Участвовать", "● Участвовать", "GO", colors.HexColor("#006400"))
+_VERDICT_REVIEW = ("🟡 Рассмотреть", "● Рассмотреть", "REVIEW", colors.HexColor("#8B6914"))
+_VERDICT_SKIP = ("🔴 Пропустить", "● Пропустить", "SKIP", colors.HexColor("#8B0000"))
+
+
+def _classify_verdict(text: str) -> Tuple[str, str, str, colors.Color]:
     """
-    Возвращает (метка, короткий код, цвет рамки).
+    Возвращает (метка_emoji, метка_pdf, код, цвет_рамки).
     🟢 Участвовать / 🟡 Рассмотреть / 🔴 Пропустить
     """
     t = (text or "").lower()
@@ -278,37 +321,37 @@ def _classify_verdict(text: str) -> Tuple[str, str, colors.Color]:
     )
     go_kw = (
         "участвовать", "рекомендуется участие", "рекомендую участвовать",
-        "целесообразно участвовать", "можно участвовать",
+        "целесообразно участвовать", "можно участвовать", "к участию",
     )
     mid_kw = (
-        "осторожн", "рассмотр", "условн", "при уточнении", "после проверки",
-        "с оговорк", "требует уточн",
+        "осторож", "рассмотр", "условн", "при уточнении", "после проверки",
+        "с оговорк", "требует уточн", "требует дополнительн",
     )
     has_skip = any(k in t for k in skip_kw)
     has_go = any(k in t for k in go_kw)
     has_mid = any(k in t for k in mid_kw)
     if has_skip:
-        return "🔴 Пропустить", "SKIP", colors.HexColor("#8B0000")
+        return _VERDICT_SKIP
     # «участвовать с осторожностью» → рассмотреть
     if has_go and has_mid:
-        return "🟡 Рассмотреть", "REVIEW", colors.HexColor("#8B6914")
+        return _VERDICT_REVIEW
     if has_go:
-        return "🟢 Участвовать", "GO", colors.HexColor("#006400")
+        return _VERDICT_GO
     if has_mid:
-        return "🟡 Рассмотреть", "REVIEW", colors.HexColor("#8B6914")
+        return _VERDICT_REVIEW
     # эвристика по экономической оценке
     eco = _na(ANSWERS.get(77, "")).lower()
     if "нецелесообраз" in eco or "не рекомендуется" in eco:
-        return "🔴 Пропустить", "SKIP", colors.HexColor("#8B0000")
+        return _VERDICT_SKIP
     if "осторож" in eco or "риск" in eco:
-        return "🟡 Рассмотреть", "REVIEW", colors.HexColor("#8B6914")
+        return _VERDICT_REVIEW
     if text and text != NA:
-        return "🟡 Рассмотреть", "REVIEW", colors.HexColor("#8B6914")
-    return "🟡 Рассмотреть", "REVIEW", colors.HexColor("#8B6914")
+        return _VERDICT_REVIEW
+    return _VERDICT_REVIEW
 
 
 VERDICT_TEXT = _na(ANSWERS.get(74, ""))
-VERDICT_LABEL, VERDICT_CODE, VERDICT_COLOR = _classify_verdict(VERDICT_TEXT)
+VERDICT_LABEL, VERDICT_LABEL_PDF, VERDICT_CODE, VERDICT_COLOR = _classify_verdict(VERDICT_TEXT)
 
 # =============================================================================
 # 5) Стили
@@ -538,14 +581,14 @@ summary_rows = [
     ("Способ отбора", _na(ANSWERS.get(11, NA))),
     ("Площадка", platform if platform != NA else "Не указано"),
     ("Ссылки", links if links != NA else "Не указано"),
-    ("Вердикт", VERDICT_LABEL),
+    ("Вердикт", VERDICT_LABEL_PDF),
 ]
 story.append(_kv_table(summary_rows))
 story.append(Spacer(1, 4 * mm))
 
-# Рамка вердикта
+# Рамка вердикта (цвет рамки = статус; в PDF — ●, без emoji)
 verdict_inner = [
-    [Paragraph(f"ИТОГОВЫЙ ВЕРДИКТ: {VERDICT_LABEL}", style_verdict)],
+    [Paragraph(f"ИТОГОВЫЙ ВЕРДИКТ: {VERDICT_LABEL_PDF}", style_verdict)],
     [_p(VERDICT_TEXT if VERDICT_TEXT != NA else "Рекомендация по участию не сформирована.", style_body)],
 ]
 vt = Table(verdict_inner, colWidths=[180 * mm])
@@ -577,7 +620,7 @@ _section_questions(story, 79, 86, "7. СТАТИСТИКА И ПОЛНОТА А�
 # --- Итоговый вердикт (развёрнутый) ---
 story.append(Paragraph("ИТОГОВЫЙ ВЕРДИКТ", style_h1))
 story.append(_kv_table([
-    ("Рекомендация", VERDICT_LABEL),
+    ("Рекомендация", VERDICT_LABEL_PDF),
     ("Обоснование", VERDICT_TEXT),
     ("Ключевые выводы", _na(ANSWERS.get(75, NA))),
     ("Экономическая целесообразность", _na(ANSWERS.get(77, NA))),
