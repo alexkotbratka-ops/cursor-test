@@ -435,6 +435,16 @@ else:
         print(f"  • {os.path.basename(path)}")
         rows.append(parse_report(path))
 
+    def _sort_key(r: Dict[str, str]):
+        # дата анализа ДД.ММ.ГГГГ → для хронологии; иначе имя файла
+        d = r.get("date") or ""
+        try:
+            return (datetime.strptime(d, "%d.%m.%Y"), r.get("tender_no") or "")
+        except ValueError:
+            return (datetime.min, r.get("file") or "")
+
+    rows.sort(key=_sort_key)
+
     formed = datetime.now()
     summary_text = format_summary(rows, formed)
     summary_filename = f"Сводная_таблица_по_тендерам_{formed.strftime('%Y%m%d_%H%M%S')}.txt"
