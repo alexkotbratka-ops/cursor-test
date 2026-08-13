@@ -68,6 +68,7 @@ from reportlab.lib.units import mm
 from reportlab.pdfbase import pdfmetrics
 from reportlab.pdfbase.ttfonts import TTFont
 from reportlab.platypus import (
+    KeepTogether,
     Paragraph,
     SimpleDocTemplate,
     Spacer,
@@ -447,24 +448,102 @@ style_footer = ParagraphStyle(
     alignment=TA_CENTER,
     textColor=colors.black,
 )
+style_label = ParagraphStyle(
+    "M7Label",
+    fontName=FONT_BOLD,
+    fontSize=11,
+    leading=14,
+    alignment=TA_LEFT,
+    spaceBefore=6,
+    spaceAfter=1,
+    textColor=colors.black,
+)
+style_answer = ParagraphStyle(
+    "M7Answer",
+    fontName=FONT_REG,
+    fontSize=11,
+    leading=14,
+    alignment=TA_JUSTIFY,
+    leftIndent=8,
+    spaceAfter=6,
+    textColor=colors.black,
+)
+
+# Ячейка Table не умеет разрываться между страницами.
+# Порог: ~0.7 страницы текста при leading=13–14 (~45 строк × ~90 символов).
+_MAX_TABLE_CHARS = 2800
+_CHUNK_CHARS = 1800  # куски для сверхдлинных ответов (параграфы)
 
 
-def _p(text: Any, style: ParagraphStyle = style_body) -> Paragraph:
-    s = _na(text)
-    # экранирование для reportlab XML
-    s = (
+def _escape_xml(s: str) -> str:
+    return (
         s.replace("&", "&amp;")
         .replace("<", "&lt;")
         .replace(">", "&gt;")
         .replace("\n", "<br/>")
     )
-    return Paragraph(s, style)
 
 
-def _kv_table(rows: List[Tuple[str, str]], col_widths: Optional[Sequence[float]] = None) -> Table:
-    data = [[_p(k, style_cell_bold), _p(v, style_cell)] for k, v in rows]
+def _p(text: Any, style: ParagraphStyle = style_body) -> Paragraph:
+    return Paragraph(_escape_xml(_na(text)), style)
+
+
+def _split_long_text(text: str, max_chars: int = _CHUNK_CHARS) -> List[str]:
+    """Режет длинный текст по абзацам/предложениям, чтобы flowable помещался на страницу."""
+    s = _na(text)
+    if len(s) <= max_chars:
+        return [s]
+    parts: List[str] = []
+    # сначала по пустым строкам
+    blocks = re.split(r"\n\s*\n", s)
+    buf = ""
+    for block in blocks:
+        block = block.strip()
+        if not block:
+            continue
+        if len(buf) + len(block) + 2 <= max_chars:
+            buf = f"{buf}\n\n{block}" if buf else block
+            continue
+        if buf:
+            parts.append(buf)
+            buf = ""
+        if len(block) <= max_chars:
+            buf = block
+            continue
+        # жёсткая нарезка длинного блока
+        start = 0
+        while start < len(block):
+            end = min(start + max_chars, len(block))
+            if end < len(block):
+                # откат к пробелу/переносу
+                cut = max(block.rfind("\n", start, end), block.rfind(" ", start, end))
+                if cut > start + max_chars // 3:
+                    end = cut
+            parts.append(block[start:end].strip())
+            start = end
+        buf = ""
+    if buf:
+        parts.append(buf)
+    return [p for p in parts if p] or [NA]
+
+
+def _append_paragraph_answer(story: list, title: str, answer: str) -> None:
+    """Вопрос/ответ параграфами — текст свободно переносится на следующую страницу."""
+    q = Paragraph(_escape_xml(f"Вопрос: {title}"), style_label)
+    chunks = _split_long_text(answer)
+    if len(chunks) == 1 and len(chunks[0]) <= 900:
+        # короткий блок держим вместе; длинный — по кускам (без LayoutError)
+        story.append(KeepTogether([q, Paragraph(_escape_xml(chunks[0]), style_answer)]))
+        return
+    story.append(q)
+    for chunk in chunks:
+        story.append(Paragraph(_escape_xml(chunk), style_answer))
+
+
+def _one_row_table(key: str, value: str, col_widths: Optional[Sequence[float]] = None) -> Table:
+    """Одна строка таблицы — может переехать на следующую страницу целиком."""
     w = list(col_widths) if col_widths else [55 * mm, 125 * mm]
-    t = Table(data, colWidths=w, hAlign="LEFT")
+    t = Table([[_p(key, style_cell_bold), _p(value, style_cell)]], colWidths=w, hAlign="LEFT")
     t.setStyle(
         TableStyle(
             [
@@ -476,21 +555,52 @@ def _kv_table(rows: List[Tuple[str, str]], col_widths: Optional[Sequence[float]]
                 ("RIGHTPADDING", (0, 0), (-1, -1), 4),
                 ("TOPPADDING", (0, 0), (-1, -1), 3),
                 ("BOTTOMPADDING", (0, 0), (-1, -1), 3),
-                ("BACKGROUND", (0, 0), (0, -1), colors.Color(0.95, 0.95, 0.95)),
+                ("BACKGROUND", (0, 0), (0, 0), colors.Color(0.95, 0.95, 0.95)),
             ]
         )
     )
     return t
 
 
-def _section_questions(story: list, q_from: int, q_to: int, title: str) -> None:
+def _kv_table(rows: List[Tuple[str, str]], col_widths: Optional[Sequence[float]] = None) -> list:
+    """
+    Сводная/короткая карточка: каждая строка — отдельная Table.
+    Длинные значения (>_MAX_TABLE_CHARS) выводятся параграфами (без LayoutError).
+    """
+    flowables: list = []
+    for k, v in rows:
+        val = _na(v)
+        if len(val) > _MAX_TABLE_CHARS:
+            _append_paragraph_answer(flowables, k, val)
+        else:
+            flowables.append(_one_row_table(k, val, col_widths))
+    return flowables
+
+
+def _section_as_table(story: list, q_from: int, q_to: int, title: str) -> None:
+    """Разделы 1–5: таблицы вопрос/ответ (по одной строке на вопрос)."""
     story.append(Paragraph(title, style_h1))
     by_num = {int(q["num"]): q for q in QUESTIONS_M7 if "num" in q}
     for n in range(q_from, q_to + 1):
         q = by_num.get(n, {"num": n, "title": f"Вопрос {n}"})
-        title_q = f"{n}. {_na(q.get('title', f'Вопрос {n}'))}"
-        story.append(Paragraph(title_q, style_q_title))
-        story.append(_p(ANSWERS.get(n, NA), style_body))
+        q_title = f"{n}. {_na(q.get('title', f'Вопрос {n}'))}"
+        ans = _na(ANSWERS.get(n, NA))
+        if len(ans) > _MAX_TABLE_CHARS:
+            # длинный ответ — параграфы, иначе LayoutError
+            _append_paragraph_answer(story, q_title, ans)
+        else:
+            story.append(_one_row_table(q_title, ans))
+            story.append(Spacer(1, 2 * mm))
+
+
+def _section_as_paragraphs(story: list, q_from: int, q_to: int, title: str) -> None:
+    """Разделы 6–7 и длинные тексты: параграфы с переносом страниц."""
+    story.append(Paragraph(title, style_h1))
+    by_num = {int(q["num"]): q for q in QUESTIONS_M7 if "num" in q}
+    for n in range(q_from, q_to + 1):
+        q = by_num.get(n, {"num": n, "title": f"Вопрос {n}"})
+        q_title = f"{n}. {_na(q.get('title', f'Вопрос {n}'))}"
+        _append_paragraph_answer(story, q_title, _na(ANSWERS.get(n, NA)))
 
 
 # =============================================================================
@@ -583,16 +693,15 @@ summary_rows = [
     ("Ссылки", links if links != NA else "Не указано"),
     ("Вердикт", VERDICT_LABEL_PDF),
 ]
-story.append(_kv_table(summary_rows))
+story.extend(_kv_table(summary_rows))
 story.append(Spacer(1, 4 * mm))
 
-# Рамка вердикта (цвет рамки = статус; в PDF — ●, без emoji)
-verdict_inner = [
-    [Paragraph(f"ИТОГОВЫЙ ВЕРДИКТ: {VERDICT_LABEL_PDF}", style_verdict)],
-    [_p(VERDICT_TEXT if VERDICT_TEXT != NA else "Рекомендация по участию не сформирована.", style_body)],
-]
-vt = Table(verdict_inner, colWidths=[180 * mm])
-vt.setStyle(
+# Рамка вердикта: заголовок в таблице; длинный текст — параграфами (без LayoutError)
+verdict_hdr = Table(
+    [[Paragraph(f"ИТОГОВЫЙ ВЕРДИКТ: {VERDICT_LABEL_PDF}", style_verdict)]],
+    colWidths=[180 * mm],
+)
+verdict_hdr.setStyle(
     TableStyle(
         [
             ("BOX", (0, 0), (-1, -1), 1.5, VERDICT_COLOR),
@@ -600,33 +709,36 @@ vt.setStyle(
             ("RIGHTPADDING", (0, 0), (-1, -1), 8),
             ("TOPPADDING", (0, 0), (-1, -1), 6),
             ("BOTTOMPADDING", (0, 0), (-1, -1), 6),
-            ("BACKGROUND", (0, 0), (-1, 0), colors.Color(0.93, 0.93, 0.93)),
-            ("VALIGN", (0, 0), (-1, -1), "TOP"),
+            ("BACKGROUND", (0, 0), (-1, -1), colors.Color(0.93, 0.93, 0.93)),
         ]
     )
 )
-story.append(vt)
+story.append(verdict_hdr)
+_vtxt = VERDICT_TEXT if VERDICT_TEXT != NA else "Рекомендация по участию не сформирована."
+for chunk in _split_long_text(_vtxt):
+    story.append(_p(chunk, style_body))
 story.append(Spacer(1, 6 * mm))
 
-# --- Разделы 1–7 ---
-_section_questions(story, 1, 11, "1. ОБЩАЯ ИНФОРМАЦИЯ")
-_section_questions(story, 12, 21, "2. ТРЕБОВАНИЯ К УЧАСТНИКАМ")
-_section_questions(story, 22, 37, "3. ТЕХНИЧЕСКИЕ ТРЕБОВАНИЯ")
-_section_questions(story, 38, 53, "4. УСЛОВИЯ КОНТРАКТА")
-_section_questions(story, 54, 66, "5. ФИНАНСОВЫЕ УСЛОВИЯ")
-_section_questions(story, 67, 78, "6. РИСКИ И РЕКОМЕНДАЦИИ")
-_section_questions(story, 79, 86, "7. СТАТИСТИКА И ПОЛНОТА АНАЛИЗА")
+# --- Разделы 1–5: таблицы; 6–7: параграфы (длинные synthesize-ответы) ---
+_section_as_table(story, 1, 11, "1. ОБЩАЯ ИНФОРМАЦИЯ")
+_section_as_table(story, 12, 21, "2. ТРЕБОВАНИЯ К УЧАСТНИКАМ")
+_section_as_table(story, 22, 37, "3. ТЕХНИЧЕСКИЕ ТРЕБОВАНИЯ")
+_section_as_table(story, 38, 53, "4. УСЛОВИЯ КОНТРАКТА")
+_section_as_table(story, 54, 66, "5. ФИНАНСОВЫЕ УСЛОВИЯ")
+_section_as_paragraphs(story, 67, 78, "6. РИСКИ И РЕКОМЕНДАЦИИ")
+_section_as_paragraphs(story, 79, 86, "7. СТАТИСТИКА И ПОЛНОТА АНАЛИЗА")
 
-# --- Итоговый вердикт (развёрнутый) ---
+# --- Итоговый вердикт (развёрнутый) — только параграфы ---
 story.append(Paragraph("ИТОГОВЫЙ ВЕРДИКТ", style_h1))
-story.append(_kv_table([
+for label, val in (
     ("Рекомендация", VERDICT_LABEL_PDF),
     ("Обоснование", VERDICT_TEXT),
     ("Ключевые выводы", _na(ANSWERS.get(75, NA))),
     ("Экономическая целесообразность", _na(ANSWERS.get(77, NA))),
     ("Рекомендация по цене", _na(ANSWERS.get(78, NA))),
     ("Полнота анализа", _na(ANSWERS.get(86, NA))),
-]))
+):
+    _append_paragraph_answer(story, label, val)
 story.append(Spacer(1, 4 * mm))
 story.append(_p(
     "Рекомендации по участию: руководствуйтесь разделом 6 (риски) и вердиктом выше. "
